@@ -1,0 +1,52 @@
+# vtknet test lab — reproducible targets for live verification.
+#
+#   docker compose -f lab/docker-compose.yml up -d
+#   sudo lab/verify.sh 172.20.0.10        # run the toolkit against the lab
+#   docker compose -f lab/docker-compose.yml down
+#
+# Everything here is a throwaway lab target you fully control.
+
+services:
+  web:
+    image: nginx:alpine
+    container_name: vtknet-lab-web
+    ports:
+      - "8080:80"
+    networks:
+      lab:
+        ipv4_address: 172.20.0.10
+
+  echo:
+    image: python:3-alpine
+    container_name: vtknet-lab-echo
+    command: >
+      python -c "import socketserver,sys;
+      class H(socketserver.BaseRequestHandler):
+          def handle(self):
+              self.request.sendall(b'vtknet-lab-echo\n')
+      socketserver.TCPServer.allow_reuse_address=True;
+      socketserver.TCPServer(('0.0.0.0', 9000), H).serve_forever()"
+    ports:
+      - "9000:9000"
+    networks:
+      lab:
+        ipv4_address: 172.20.0.11
+
+  tls:
+    image: python:3-alpine
+    container_name: vtknet-lab-tls
+    volumes:
+      - ./tls_server.py:/tls_server.py:ro
+    command: python /tls_server.py --port 8443 --cn lab.local
+    ports:
+      - "8443:8443"
+    networks:
+      lab:
+        ipv4_address: 172.20.0.12
+
+networks:
+  lab:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24

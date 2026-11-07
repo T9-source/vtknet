@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vtknet"
+version = "0.5.0"
+description = "Evidence-driven network testing toolkit built on Scapy: packet-in/packet-out pipeline, structured JSON findings with raw-packet proof."
+readme = "README.md"
+requires-python = ">=3.9"
+keywords = ["scapy", "network", "security", "scanning", "packet-crafting"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Topic :: System :: Networking",
+]
+dependencies = ["scapy>=2.6", "cryptography>=3.4", "typing_extensions>=4.4"]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+vtk = "vtknet.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"

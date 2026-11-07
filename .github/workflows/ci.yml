@@ -1,0 +1,22 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: install
+        run: pip install -e .
+      - name: unit tests (no live traffic — dry-run and pure builders only)
+        run: python -m unittest discover -s tests -t . -v
+      - name: lint
+        run: |
+          pip install ruff
+          ruff check src tests

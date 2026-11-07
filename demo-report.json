@@ -1,0 +1,32 @@
+{
+  "command": "scan",
+  "args": {
+    "command": "scan",
+    "iface": null,
+    "timeout": 2.0,
+    "retry": 1,
+    "rate": 100.0,
+    "jitter": 0.0,
+    "json": true,
+    "out": "/home/admincontrol/Desktop/New Folder/vtknet/demo-report.json",
+    "dry_run": true,
+    "verbose": 0,
+    "target": "127.0.0.1",
+    "ports": "22,80,443",
+    "scan_type": "syn"
+  },
+  "started": "2026-11-05T22:23:46.817+00:00",
+  "finished": "2026-11-05T22:23:46.823+00:00",
+  "duration_s": 0.006,
+  "stats": {
+    "sent": 3,
+    "answered": 0,
+    "unanswered": 3,
+    "open": 0,
+    "closed": 0,
+    "filtered": 3,
+    "unfiltered": 0,
+    "open|filtered": 0
+  },
+  "findings": []
+}
