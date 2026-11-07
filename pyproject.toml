@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vtknet"
-version = "0.5.0"
+version = "0.6.0"
 description = "Evidence-driven network testing toolkit built on Scapy: packet-in/packet-out pipeline, structured JSON findings with raw-packet proof."
 readme = "README.md"
 requires-python = ">=3.9"

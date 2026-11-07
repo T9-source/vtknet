@@ -53,7 +53,28 @@ root. `synth`, `sniff --offline`, `wifi --offline`, `inspect` and `pcap` never d
 | `mitm` | ARP poisoning kit with **automatic restore**: correct bindings pushed 3× on exit, ip_forward reverted if we changed it | yes |
 | `inspect` | decode evidence hex / file / pcap bytes back into layers + the exact rebuild command | no |
 | `pcap` | streaming pcap statistics — protocols, top talkers, conversations — without loading the file | no |
+| `report` | query the run history: `--list`, `--show N`, `--diff A B` (added/removed/changed) | no |
+| `dns` | same query to N resolvers — divergent answers = suspected spoofing (HIGH) | yes |
+| `dhcp` | broadcast discover, classify every offer — rogue-server detection (`--known-server`) | yes |
 | `plugins` | list discovered plugins (see below) | no |
+
+## Temporal memory (history + diff)
+
+Every network-truth run auto-persists to `~/.vtknet/history.db` (SQLite).
+Dry-runs, `synth`, `inspect` and `report` never save. Relocate with the global
+`--db PATH`, opt out with `--no-save`.
+
+```bash
+sudo vtk scan 10.0.0.5 --ports 1-1024 --type syn      # auto-saved
+vtk report --list                                      # recent runs
+vtk report --show 3                                    # full JSON of run #3
+vtk report --diff 2 3                                  # added/removed/changed
+```
+
+Diffing keys findings by identity (`module|kind|host|port`) and ignores
+volatile detail (timestamps, capture counters) — re-running the same scan
+against the same target yields a clean, empty diff. A newly open port shows
+up as `diff.added` (LOW); a changed TLS certificate as `diff.changed`.
 
 ## Plugins
 

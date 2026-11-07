@@ -52,13 +52,15 @@ class Engine:
     # -- sending ---------------------------------------------------------
 
     def send_recv(
-        self, pkts: list[Packet], l2: bool = False
+        self, pkts: list[Packet], l2: bool = False, multi: bool = False
     ) -> tuple[list[tuple[Packet, Packet]], list[Packet]]:
         """Send a list of packets and collect replies.
 
         Returns ``(answered, unanswered)``: answered is a list of
         ``(sent, reply)`` pairs; unanswered are probes that timed out
-        (including after ``retry`` rounds).
+        (including after ``retry`` rounds). ``multi=True`` collects every
+        reply per probe (DHCP offers, multiple responders) instead of the
+        first one.
         """
         if self.cfg.dry_run:
             return self._dry_run(pkts)
@@ -73,6 +75,7 @@ class Engine:
                 retry=self.cfg.retry,
                 inter=self._inter(),
                 verbose=0,
+                multi=multi,
             )
             answered.extend(ans)
             unanswered.extend(unans)
