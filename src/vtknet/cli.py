@@ -117,6 +117,12 @@ def build_parser(plugin_dirs: list[str] | None = None) -> argparse.ArgumentParse
     common.add_argument("--timeout", type=float, default=2.0, help="reply timeout in seconds")
     common.add_argument("--retry", type=int, default=1, help="retransmission rounds for unanswered probes")
     common.add_argument("--rate", type=float, default=100.0, help="packets per second (0 = unlimited)")
+    common.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="parallel sr() workers over batches — rate is the TOTAL across workers",
+    )
     common.add_argument("--jitter", type=float, default=0.0, help="random extra delay per batch, seconds")
     common.add_argument("--json", action="store_true", help="emit machine-readable JSON report")
     common.add_argument("--report", metavar="FILE", help="also write the JSON report to FILE")
@@ -614,6 +620,7 @@ def _run(args: argparse.Namespace) -> ScanResult:
         retry=args.retry,
         rate=args.rate,
         jitter=args.jitter,
+        workers=max(1, args.workers),
         dry_run=args.dry_run,
     )
     engine = Engine(cfg)

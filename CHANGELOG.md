@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.7.0 — speed + hostile-input hardening
+
+- **Concurrent engine**: `--workers N` runs sr() batches on a thread pool
+  (each call owns its sockets); `rate` is the TOTAL across workers, so
+  politeness intent survives parallelism; results merge in batch order —
+  output stays deterministic. `workers=1` (default) is the untouched
+  sequential path.
+- **Hostile-pcap hardening**: `iter_pcap_safe` skips malformed records with a
+  bounded error budget; `pcap_summary` reports `malformed`/`junk_suspect`/
+  `truncated` and caps unique-key counters (`MAX_UNIQUE_KEYS`) so millions of
+  forged conversations cannot exhaust memory; opaque junk frames (scapy
+  leniency artifacts) are counted but never pollute stats; unreadable files
+  raise a clear `ValueError` (CLI: exit 2 with message).
+- `decode_bytes` never raises on garbage — worst case is an opaque Raw packet.
+- Stream writer failures (disk full) log and continue instead of killing a capture.
+
 ## 0.6.0 — temporal memory
 
 - **SQLite history**: every network-truth run auto-persists to

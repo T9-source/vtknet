@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import random
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from scapy.all import send, sendp, sr, sr1, srp, srp1
@@ -22,9 +23,10 @@ class EngineConfig:
     iface: str | None = None  # None -> scapy conf.iface
     timeout: float = 2.0  # seconds waiting for replies
     retry: int = 1  # retransmission rounds for unanswered packets
-    rate: float = 100.0  # packets per second; 0 disables pacing
+    rate: float = 100.0  # TOTAL packets per second across workers; 0 disables pacing
     jitter: float = 0.0  # extra random delay per batch, seconds
     batch_size: int = 64  # packets per sr() call when pacing
+    workers: int = 1  # parallel sr() workers over batches (1 = sequential, no threads)
     dry_run: bool = False  # build packets, send nothing
 
 
@@ -37,9 +39,16 @@ class Engine:
     # -- pacing ----------------------------------------------------------
 
     def _inter(self) -> float:
-        """Per-batch inter-packet delay: 1/rate plus uniform jitter."""
-        base = 0.0 if self.cfg.rate <= 0 else 1.0 / self.cfg.rate
-        if self.cfg.jitter > 0 and base > 0:
+        """Per-batch inter-packet delay.
+
+        ``rate`` is the TOTAL target rate across all workers, so each worker
+        paces at rate/workers — politeness intent survives parallelism.
+        """
+        if self.cfg.rate <= 0:
+            return 0.0
+        workers = max(1, self.cfg.workers)
+        base = workers / self.cfg.rate
+        if self.cfg.jitter > 0:
             base += random.uniform(0.0, self.cfg.jitter)
         return base
 
@@ -51,6 +60,21 @@ class Engine:
 
     # -- sending ---------------------------------------------------------
 
+    def _run_chunk(
+        self, chunk: list[Packet], l2: bool, multi: bool
+    ) -> tuple[list[tuple[Packet, Packet]], list[Packet]]:
+        """One sr()/srp() call over one batch — each call owns its sockets."""
+        sr_fn = srp if l2 else sr
+        return sr_fn(
+            chunk,
+            iface=self.cfg.iface,
+            timeout=self.cfg.timeout,
+            retry=self.cfg.retry,
+            inter=self._inter(),
+            verbose=0,
+            multi=multi,
+        )
+
     def send_recv(
         self, pkts: list[Packet], l2: bool = False, multi: bool = False
     ) -> tuple[list[tuple[Packet, Packet]], list[Packet]]:
@@ -60,25 +84,32 @@ class Engine:
         ``(sent, reply)`` pairs; unanswered are probes that timed out
         (including after ``retry`` rounds). ``multi=True`` collects every
         reply per probe (DHCP offers, multiple responders) instead of the
-        first one.
+        first one. With ``workers > 1`` batches run on a thread pool —
+        each sr() call owns its own sockets — and results are merged in
+        batch order, so output stays deterministic.
         """
         if self.cfg.dry_run:
             return self._dry_run(pkts)
-        sr_fn = srp if l2 else sr
+        chunks = list(self._chunks(pkts))
         answered: list[tuple[Packet, Packet]] = []
         unanswered: list[Packet] = []
-        for chunk in self._chunks(pkts):
-            ans, unans = sr_fn(
-                chunk,
-                iface=self.cfg.iface,
-                timeout=self.cfg.timeout,
-                retry=self.cfg.retry,
-                inter=self._inter(),
-                verbose=0,
-                multi=multi,
+        if self.cfg.workers <= 1 or len(chunks) <= 1:
+            for chunk in chunks:
+                ans, unans = self._run_chunk(chunk, l2, multi)
+                answered.extend(ans)
+                unanswered.extend(unans)
+        else:
+            log.info(
+                "sending %d batch(es) across %d workers (total rate %.0f pps)",
+                len(chunks),
+                self.cfg.workers,
+                self.cfg.rate,
             )
-            answered.extend(ans)
-            unanswered.extend(unans)
+            with ThreadPoolExecutor(max_workers=self.cfg.workers) as pool:
+                results = list(pool.map(lambda c: self._run_chunk(c, l2, multi), chunks))
+            for ans, unans in results:  # pool.map preserves batch order
+                answered.extend(ans)
+                unanswered.extend(unans)
         log.debug(
             "sent=%d answered=%d unanswered=%d", len(pkts), len(answered), len(unanswered)
         )

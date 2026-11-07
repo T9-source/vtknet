@@ -123,7 +123,10 @@ class Capture:
         self._received += 1
         self._pkts.append(pkt)
         if self._writer is not None:
-            self._writer.write(pkt)
+            try:
+                self._writer.write(pkt)
+            except Exception as exc:  # noqa: BLE001 — disk-full must not kill a capture
+                log.warning("stream write failed: %s", exc)
 
     def packets(self) -> list[Packet]:
         """Snapshot of the buffered packets."""
@@ -156,6 +159,41 @@ def iter_pcap(path: str) -> Iterable[Packet]:
 
     with PcapReader(path) as reader:
         yield from reader
+
+
+def iter_pcap_safe(path: str, max_errors: int = 100, stats: dict | None = None) -> Iterable[Packet]:
+    """Stream packets from a pcap, skipping malformed records.
+
+    Hostile/truncated captures must not crash the reader: each record that
+    fails to parse is counted and skipped, and the iteration stops after
+    ``max_errors`` (record framing may be desynced by then anyway). The
+    skipped-record count lands in ``stats["malformed"]`` when a dict is given.
+    """
+    from scapy.utils import PcapReader  # local import: generator-scoped file handle
+
+    errors = 0
+    try:
+        reader_cm = PcapReader(path)
+    except Exception as exc:
+        raise ValueError(f"unreadable pcap ({path}): {exc}") from exc
+    with reader_cm as reader:
+        while True:
+            try:
+                pkt = next(reader)
+            except StopIteration:
+                break
+            except Exception as exc:  # noqa: BLE001 — hostile input must not crash us
+                errors += 1
+                log.warning("malformed pcap record skipped: %s", exc)
+                if errors >= max_errors:
+                    log.error("too many malformed records (%d) — stopping", errors)
+                    break
+                continue
+            yield pkt
+    if stats is not None:
+        stats["malformed"] = errors
+    if errors:
+        log.info("pcap %s: %d malformed record(s) skipped", path, errors)
 
 
 # -- correlation -------------------------------------------------------
