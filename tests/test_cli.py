@@ -169,5 +169,49 @@ class Phase4Test(unittest.TestCase):
             self.assertIn("vtknet — scan", content)
 
 
+class Phase5Test(unittest.TestCase):
+    def test_inspect_hex_json(self):
+        from scapy.all import IP, TCP
+
+        evidence = bytes(IP(dst="203.0.113.9") / TCP(dport=443, flags="S")).hex()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = main(["inspect", "--hex", evidence, "--json"])
+        self.assertEqual(code, EXIT_OK)
+        parsed = json.loads(buf.getvalue())
+        layers = parsed["findings"][0]["detail"]["layers"]
+        self.assertEqual(layers, ["IP", "TCP"])  # IP fallback decoding
+
+    def test_inspect_requires_one_source(self):
+        self.assertEqual(main(["inspect"]), EXIT_USAGE)
+        self.assertEqual(main(["inspect", "--hex", "aa", "--file", "x"]), EXIT_USAGE)
+
+    def test_pcap_stats_end_to_end(self):
+        from vtknet.modules.synthetic import write_trace
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "trace.pcap")
+            write_trace("tcp_scan", path, seed=5, count=9)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = main(["pcap", path, "--json"])
+            self.assertEqual(code, EXIT_OK)
+            lines = buf.getvalue().strip().splitlines()
+            parsed = json.loads("\n".join(lines[lines.index("{"):]))
+            self.assertEqual(parsed["stats"]["packets"], 9)
+
+    def test_synth_replay_dry_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "flood.pcap")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = main(
+                    ["synth", "--scenario", "syn_flood", "--pcap", path,
+                     "--count", "5", "--replay", "lo", "--dry-run"]
+                )
+            self.assertEqual(code, EXIT_OK)
+            self.assertTrue(os.path.exists(path))
+
+
 if __name__ == "__main__":
     unittest.main()

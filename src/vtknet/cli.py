@@ -9,6 +9,7 @@ import sys
 import time
 
 import vtknet
+from vtknet.core import inspect as inspect_mod
 from vtknet.core import plugins as plugins_mod
 from vtknet.core import report
 from vtknet.core.capture import Capture, CaptureConfig
@@ -34,6 +35,8 @@ BUILTIN_COMMANDS = {
     "fuzz",
     "wifi",
     "mitm",
+    "inspect",
+    "pcap",
     "plugins",
 }
 
@@ -126,7 +129,23 @@ def build_parser(plugin_dirs: list[str] | None = None) -> argparse.ArgumentParse
     p_synth.add_argument("--count", type=int, default=50, help="packets/events per scenario")
     p_synth.add_argument("--target", default="192.0.2.9", help="address the scenario points at")
     p_synth.add_argument("--domain", default=None, help="base domain for dns_tunnel scenario")
+    p_synth.add_argument(
+        "--replay", metavar="IFACE", help="replay the generated pcap on IFACE via tcpreplay (root)"
+    )
+    p_synth.add_argument("--pps", type=int, default=None, help="packets per second for replay")
     p_synth.add_argument("--list", action="store_true", help="list available scenarios and exit")
+
+    p_inspect = sub.add_parser(
+        "inspect", parents=[common], help="decode evidence hex / pcap bytes back into layers (offline)"
+    )
+    p_inspect.add_argument("--hex", dest="hex_data", default=None, help="hex string of the frame")
+    p_inspect.add_argument("--file", default=None, help="file containing hex text (or raw bytes)")
+    p_inspect.add_argument("--pcap", default=None, help="decode the first packet of a pcap file")
+
+    p_pcap = sub.add_parser(
+        "pcap", parents=[common], help="streaming pcap statistics without loading the file (offline)"
+    )
+    p_pcap.add_argument("pcap_file", help="pcap file to summarize")
 
     p_fuzz = sub.add_parser(
         "fuzz", parents=[common], help="seeded protocol fuzzer with liveness crash detection"
@@ -175,8 +194,10 @@ def build_parser(plugin_dirs: list[str] | None = None) -> argparse.ArgumentParse
 
 def _needs_raw_sockets(args: argparse.Namespace) -> bool:
     """Commands that touch raw sockets (offline modes and synth need no privileges)."""
-    if args.command in ("synth", "plugins"):
+    if args.command in ("inspect", "pcap", "plugins"):
         return False
+    if args.command == "synth":
+        return bool(getattr(args, "replay", None))  # tcpreplay sends on a real iface
     if args.command in ("sniff", "wifi"):
         return args.offline is None
     return True  # builtins and plugins may send raw packets; warn conservatively
@@ -216,13 +237,12 @@ def _run_sniff(args: argparse.Namespace, result: ScanResult) -> None:
         filter_bpf=args.bpf,
         count=args.count,
         timeout=args.timeout,
+        stream_to=args.out,  # stream to pcap while capturing — never OOM on long runs
     )
     cap = Capture(cfg)
     cap.start()
     cap.wait(timeout=max(args.timeout, 15.0) + 5.0)
     cap.stop()
-    if args.out:
-        cap.write_pcap(args.out)
     st = cap.stats()
     result.findings = [
         Finding(
@@ -270,6 +290,84 @@ def _run_synth(args: argparse.Namespace, result: ScanResult) -> None:
         )
     ]
     result.stats = {"written": meta.count}
+    if args.replay:
+        if args.dry_run:
+            log.info(
+                "dry-run: would replay %s on %s via tcpreplay (pps=%s)",
+                args.pcap,
+                args.replay,
+                args.pps,
+            )
+            return
+        log.info("replaying %s on %s via tcpreplay", args.pcap, args.replay)
+        n = synthetic.replay_trace(args.pcap, args.replay, pps=args.pps)
+        result.findings.append(
+            Finding(module="synthetic", kind="trace.replayed", host="-",
+                    detail={"pcap": args.pcap, "iface": args.replay, "packets": n, "pps": args.pps})
+        )
+        result.stats["replayed"] = n
+
+
+def _run_inspect(args: argparse.Namespace, result: ScanResult) -> None:
+    sources = sum(bool(x) for x in (args.hex_data, args.file, args.pcap))
+    if sources != 1:
+        raise ValueError("inspect needs exactly one of --hex / --file / --pcap")
+    if args.hex_data:
+        data = inspect_mod.parse_evidence(args.hex_data)
+    elif args.file:
+        with open(args.file, "rb") as fh:
+            raw = fh.read()
+        try:
+            data = inspect_mod.parse_evidence(raw.decode("ascii", errors="ignore"))
+        except ValueError:
+            data = raw  # not hex text — treat as raw wire bytes
+    else:
+        first = next(iter(vtknet_capture_iter(args.pcap)), None)
+        if first is None:
+            raise ValueError(f"pcap contains no packets: {args.pcap}")
+        data = bytes(first)
+
+    pkt = inspect_mod.decode_bytes(data)
+    show_text = pkt.show(dump=True)
+    command = pkt.command()
+    layers = [l.__name__ for l in pkt.layers()]
+    result.findings = [
+        Finding(
+            module="inspect",
+            kind="inspect.done",
+            host="-",
+            detail={
+                "length": len(data),
+                "layers": layers,
+                "summary": pkt.summary(),
+                "command": command,
+                "show": show_text,
+            },
+        )
+    ]
+    result.stats = {"decoded": len(data)}
+    if not args.json:
+        print(show_text)
+        print("command:", command)
+
+
+def vtknet_capture_iter(path: str):
+    from vtknet.core.capture import iter_pcap
+
+    return iter_pcap(path)
+
+
+def _run_pcap(args: argparse.Namespace, result: ScanResult) -> None:
+    summary = inspect_mod.pcap_summary(args.pcap_file)
+    result.findings = [
+        Finding(
+            module="inspect",
+            kind="pcap.summary",
+            host=args.pcap_file,
+            detail=summary,
+        )
+    ]
+    result.stats = {"packets": summary["packets"]}
 
 
 def _run_fuzz(args: argparse.Namespace, engine: Engine, result: ScanResult) -> None:
@@ -439,6 +537,10 @@ def _run(args: argparse.Namespace) -> ScanResult:
         _run_wifi(args, result)
     elif args.command == "mitm":
         _run_mitm(args, engine, result)
+    elif args.command == "inspect":
+        _run_inspect(args, result)
+    elif args.command == "pcap":
+        _run_pcap(args, result)
     else:  # pragma: no cover — argparse enforces choices
         raise ValueError(f"unknown command: {args.command}")
     result.finish(time.monotonic() - started)
@@ -457,6 +559,9 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         log.error("%s", exc)
         return EXIT_USAGE
+    except RuntimeError as exc:
+        log.error("%s", exc)
+        return EXIT_RUNTIME
     except KeyboardInterrupt:
         log.error("interrupted by user")
         return EXIT_RUNTIME

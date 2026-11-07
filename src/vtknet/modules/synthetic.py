@@ -15,7 +15,8 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from scapy.all import ARP, DNS, DNSQR, IP, TCP, UDP, Ether, wrpcap
+from scapy.all import ARP, DNS, DNSQR, IP, TCP, UDP, Ether, Raw, rdpcap, wrpcap
+from scapy.layers.inet import fragment
 from scapy.packet import Packet
 
 import vtknet
@@ -129,6 +130,24 @@ def _arp_spoof(rng: random.Random, p: dict[str, Any]) -> list[Packet]:
     ]
 
 
+@_register("frag_evasion", "One TCP stream shuffled into out-of-order IP fragments (reassembly-test signature).")
+def _frag_evasion(rng: random.Random, p: dict[str, Any]) -> list[Packet]:
+    target = p["target"]
+    count = max(2, p["count"])  # fragments in the stream
+    # size the payload so payload + TCP header splits into exactly `count` fragments
+    payload = bytes(rng.getrandbits(8) for _ in range(512 * count - 20))
+    base = (
+        IP(dst=target)
+        / TCP(sport=rng.randint(1024, 65535), dport=p.get("dport", 80), flags="PA")
+        / Raw(payload)
+    )
+    frags = fragment(base, fragsize=512)
+    order = list(range(len(frags)))
+    rng.shuffle(order)  # out-of-order arrival: does the monitor reassemble?
+    src_mac = _rand_mac(rng)
+    return [Ether(src=src_mac, dst=BROADCAST_MAC) / frags[i] for i in order]
+
+
 # -- public API -------------------------------------------------------------
 
 
@@ -157,6 +176,8 @@ def build_trace(
     iocs = {"target": target}
     if name == "dns_tunnel":
         iocs["queried_domain"] = base_domain
+    if name == "frag_evasion":
+        iocs["fragments"] = len(pkts)
     meta = TraceMeta(
         name=name,
         description=_SCENARIOS[name][1],
@@ -176,3 +197,22 @@ def write_trace(name: str, path: str, **kwargs: Any) -> TraceMeta:
         json.dump({"tool": "vtknet", "version": vtknet.__version__, **asdict(meta)}, fh, indent=2)
     log.info("trace %s: %d packets -> %s (meta: %s)", name, meta.count, path, sidecar)
     return meta
+
+
+def replay_trace(trace: str | list[Packet], iface: str, pps: float | None = None) -> int:
+    """Replay a pcap file (or packet list) at wire speed via tcpreplay/sendpfast.
+
+    Requires the ``tcpreplay`` binary and root on a real interface.
+    Raises RuntimeError with a clear message on failure; returns packet count.
+    """
+    from scapy.sendrecv import sendpfast  # local: tcpreplay binary only needed here
+
+    pkts = rdpcap(trace) if isinstance(trace, str) else trace
+    try:
+        sendpfast(pkts, pps=pps, iface=iface)
+    except Exception as exc:
+        raise RuntimeError(
+            f"replay failed on {iface} (is tcpreplay installed and the interface up?): {exc}"
+        ) from exc
+    log.info("replayed %d packets on %s (pps=%s)", len(pkts), iface, pps)
+    return len(pkts)

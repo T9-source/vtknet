@@ -1,12 +1,8 @@
 import unittest
 
-from scapy.all import IP, TCP, Raw
-
-from vtknet.core.engine import EngineConfig
 from vtknet.modules.tlsprobe import (
     build_client_hello_bytes,
     parse_server_hello,
-    tls_probe,
 )
 
 
@@ -57,42 +53,8 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(info["description"], 40)
 
 
-class _FakeEngine:
-    """Duck-typed Engine: SYN gets a canned SYN-ACK; probe gets a canned ServerHello."""
-
-    def __init__(self) -> None:
-        self.cfg = EngineConfig(dry_run=False)
-        self.reply = IP(src="203.0.113.9", dst="192.0.2.5") / TCP(
-            sport=443, dport=55555, flags="PA"
-        ) / Raw(_server_hello_record())
-
-    def send1(self, pkt, l2: bool = False):
-        if pkt.haslayer(TCP) and int(pkt[TCP].flags) == 0x02:
-            return IP(src="203.0.113.9", dst=pkt[IP].src) / TCP(
-                sport=pkt[TCP].dport, dport=pkt[TCP].sport, flags="SA", seq=100
-            )
-        return None
-
-    def send(self, pkts, l2: bool = False) -> None:
-        return None
-
-    def send_recv(self, pkts, l2: bool = False):
-        probe = pkts[0]
-        self.reply[TCP].dport = probe[TCP].sport
-        return [(probe, self.reply)], []
-
-
-class ProbeFlowTest(unittest.TestCase):
-    def test_full_probe_flow_returns_serverhello_finding(self):
-        findings, stats = tls_probe(_FakeEngine(), "203.0.113.9", port=443, sni="example.com")
-        self.assertEqual(stats["sent"], 3)
-        self.assertEqual(len(findings), 1)
-        f = findings[0]
-        self.assertEqual(f.kind, "tls.serverhello")
-        self.assertEqual(f.state, "open")
-        self.assertEqual(f.detail["cipher"], 0xC02F)
-        self.assertEqual(f.detail["version_int"], "0x0303")
-        self.assertEqual(f.evidence[0].kind, "packet_hex")
+# Probe flow tests moved to test_tls_certs.py (FakeLink + link_factory DI) —
+# the live path must NEVER open real sockets from the test suite.
 
 
 if __name__ == "__main__":

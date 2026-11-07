@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import logging
 import random
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
-from scapy.all import IP, TCP
+from scapy.all import Raw
 
 from vtknet.core.engine import Engine
 from vtknet.core.models import Evidence, Finding, Severity
@@ -27,8 +28,6 @@ try:  # scapy TLS layers need ``cryptography`` at import time in some setups
     _HAS_TLS = True
 except Exception:  # noqa: BLE001 — import failure modes vary by scapy/env; degrade gracefully
     _HAS_TLS = False
-
-TCP_SYN, TCP_ACK = 0x02, 0x10
 
 DEFAULT_CIPHERS = [
     0x1301,  # TLS_AES_128_GCM_SHA256
@@ -185,17 +184,34 @@ def certificate_findings(dst: str, port: int, ders: list[bytes]) -> list[Finding
     return out
 
 
-# -- live probe ------------------------------------------------------------
+# -- live probe (TCP_client supersocket: correct seq/ack + retransmits) -----
+
+
+def _default_link_factory(dst: str, port: int) -> Any:
+    """Userspace TCP conversation via scapy's TCP_client automaton (root needed)."""
+    from scapy.layers.inet import TCP_client  # local: pulls automaton machinery
+
+    return TCP_client.tcplink(Raw, dst, port)
 
 
 def tls_probe(
-    engine: Engine, dst: str, port: int = 443, sni: str | None = None
+    engine: Engine,
+    dst: str,
+    port: int = 443,
+    sni: str | None = None,
+    link_factory: Callable[[str, int], Any] | None = None,
 ) -> tuple[list[Finding], dict[str, int]]:
-    """TCP-handshake to dst:port, send a ClientHello, parse the ServerHello."""
+    """Open a TCP conversation to dst:port, send a ClientHello, classify the reply.
+
+    The handshake runs over scapy's ``TCP_client`` automaton — SYN, ACKs and
+    retransmissions handled by the supersocket instead of hand-tracked
+    seq/ack. Pass ``link_factory`` to inject a fake supersocket (tests).
+    """
     if engine.cfg.dry_run:
         hello = build_client_hello_bytes(sni=sni)
         log.info(
-            "dry-run: would TCP-handshake %s:%d then send a %d-byte ClientHello (sni=%s)",
+            "dry-run: would open a TCP conversation to %s:%d and send a %d-byte "
+            "ClientHello (sni=%s)",
             dst,
             port,
             len(hello),
@@ -203,59 +219,49 @@ def tls_probe(
         )
         return [], {"sent": 0}
 
-    rng = random.Random()
-    sport, seq = rng.randint(1024, 65535), rng.getrandbits(31)
-
-    syn = IP(dst=dst) / TCP(sport=sport, dport=port, flags="S", seq=seq)
-    synack = engine.send1(syn)
-    if synack is None or not synack.haslayer(TCP):
-        return [_finding(dst, "tls.no-response", port, sni, state="filtered")], {
-            "sent": 1,
-            "answered": 0,
-        }
-    if int(synack[TCP].flags) & (TCP_SYN | TCP_ACK) != (TCP_SYN | TCP_ACK):
-        return [_finding(dst, "tls.no-synack", port, sni, state="filtered")], {
-            "sent": 1,
-            "answered": 1,
-        }
-
-    srv_seq = synack[TCP].seq + 1
-    engine.send(IP(dst=dst) / TCP(sport=sport, dport=port, flags="A", seq=seq + 1, ack=srv_seq))
-
-    hello = build_client_hello_bytes(sni=sni, rng=rng)
-    probe = IP(dst=dst) / TCP(sport=sport, dport=port, flags="PA", seq=seq + 1, ack=srv_seq) / hello
-    answered, _ = engine.send_recv([probe])
+    factory = link_factory or _default_link_factory
+    payloads: list[bytes] = []
+    primary: dict[str, Any] | None = None
+    try:
+        link = factory(dst, port)
+    except Exception as exc:  # noqa: BLE001 — connect failures come in many shapes
+        log.warning("could not open conversation to %s:%d: %s", dst, port, exc)
+        return [_finding(dst, "tls.no-response", port, sni, state="filtered")], {"sent": 0}
+    try:
+        link.send(build_client_hello_bytes(sni=sni))
+        for _ in range(5):  # bounded flight collection: ServerHello + certificates
+            chunk = link.recv()  # automaton ends itself on its internal timeouts
+            if not chunk:
+                break
+            data = bytes(chunk)
+            payloads.append(data)
+            if primary is None:
+                info = parse_server_hello(data)
+                if info["kind"] not in ("tls.other", "tls.parse-error"):
+                    primary = info
+    finally:
+        try:
+            link.close()
+        except Exception as exc:  # noqa: BLE001 — closing an already-dead socket is not fatal
+            log.debug("link close: %s", exc)
 
     findings: list[Finding] = []
-    tls_replies = 0
-    payloads: list[bytes] = []
-    for _, rep in answered:
-        payload = bytes(rep[TCP].payload) if rep.haslayer(TCP) else b""
-        if not payload:
-            continue
-        payloads.append(payload)
-        info = parse_server_hello(payload)
-        if info["kind"] in ("tls.other", "tls.parse-error"):
-            continue
-        tls_replies += 1
-        detail: dict[str, Any] = {"port": port, "sni": sni or dst, **info}
+    if primary is not None:
         findings.append(
             Finding(
                 module="tlsprobe",
-                kind=info["kind"],
+                kind=primary["kind"],
                 host=dst,
                 port=port,
-                state="open" if info["kind"] == "tls.serverhello" else None,
-                detail=detail,
-                evidence=[Evidence("packet_hex", payload.hex(), "server TLS record")],
+                state="open" if primary["kind"] == "tls.serverhello" else None,
+                detail={"port": port, "sni": sni or dst, **primary},
+                evidence=[Evidence("packet_hex", payloads[0].hex(), "server TLS record")],
             )
         )
-        break  # the first classified record decides the primary finding
-
     if not findings:
         findings.append(_finding(dst, "tls.no-data", port, sni, state="open"))
     findings.extend(certificate_findings(dst, port, extract_certificates(b"".join(payloads))))
-    stats = {"sent": 3, "answered": len(answered), "tls_payload_replies": tls_replies}
+    stats = {"sent": 1, "chunks": len(payloads)}
     log.info("tls probe %s:%d -> %s", dst, port, findings[0].kind)
     return findings, stats
 

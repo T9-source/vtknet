@@ -5,7 +5,6 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
-from scapy.all import IP, TCP, Raw
 
 from vtknet.core.engine import EngineConfig
 from vtknet.modules.tlsprobe import (
@@ -93,36 +92,80 @@ class SummarizeTest(unittest.TestCase):
 
 
 class _FakeEngine:
-    def __init__(self, payload: bytes) -> None:
+    """Engine duck-type: tls_probe only reads cfg (dry_run)."""
+
+    def __init__(self) -> None:
         self.cfg = EngineConfig()
-        self._payload = payload
 
-    def send1(self, pkt, l2: bool = False):
-        if pkt.haslayer(TCP) and int(pkt[TCP].flags) == 0x02:
-            return IP(src="203.0.113.9", dst=pkt[IP].src) / TCP(
-                sport=pkt[TCP].dport, dport=pkt[TCP].sport, flags="SA", seq=100
-            )
-        return None
 
-    def send(self, pkts, l2: bool = False) -> None:
-        return None
+class _FakeLink:
+    """Duck-typed TCP_client supersocket: yields canned flight chunks."""
 
-    def send_recv(self, pkts, l2: bool = False):
-        probe = pkts[0]
-        reply = IP(src="203.0.113.9", dst=probe[IP].src) / TCP(
-            sport=probe[TCP].dport, dport=probe[TCP].sport, flags="PA"
-        ) / Raw(self._payload)
-        return [(probe, reply)], []
+    def __init__(self, chunks) -> None:
+        self._chunks = list(chunks)
+        self.sent = None
+        self.closed = False
+
+    def send(self, data) -> None:
+        self.sent = bytes(data)
+
+    def recv(self):
+        return self._chunks.pop(0) if self._chunks else None
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class ProbeFlowTest(unittest.TestCase):
     def test_probe_returns_serverhello_and_certificate(self):
-        payload = _server_hello_record() + _cert_record(_make_cert(60))
-        findings, stats = tls_probe(_FakeEngine(payload), "203.0.113.9", 443, sni="lab.local")
+        chunks = [_server_hello_record(), _cert_record(_make_cert(60))]
+        fake = _FakeLink(chunks)
+        findings, stats = tls_probe(
+            _FakeEngine(),
+            "203.0.113.9",
+            443,
+            sni="lab.local",
+            link_factory=lambda ip, port: fake,
+        )
         kinds = [f.kind for f in findings]
         self.assertEqual(kinds[0], "tls.serverhello")
         self.assertEqual(kinds[1], "tls.certificate")
-        self.assertEqual(stats["tls_payload_replies"], 1)
+        self.assertEqual(stats["chunks"], 2)
+        self.assertTrue(fake.closed)
+        self.assertEqual(fake.sent[:1], b"\x16")  # a TLS handshake record went out
+
+    def test_no_data_yields_no_data_finding(self):
+        fake = _FakeLink([])
+        findings, stats = tls_probe(
+            _FakeEngine(), "203.0.113.9", 443, link_factory=lambda ip, port: fake
+        )
+        self.assertEqual(findings[0].kind, "tls.no-data")
+        self.assertEqual(stats["chunks"], 0)
+        self.assertTrue(fake.closed)
+
+    def test_connect_failure_yields_no_response(self):
+        def broken_factory(ip, port):
+            raise OSError("no route")
+
+        findings, stats = tls_probe(
+            _FakeEngine(), "203.0.113.9", 443, link_factory=broken_factory
+        )
+        self.assertEqual(findings[0].kind, "tls.no-response")
+        self.assertEqual(stats["sent"], 0)
+
+    def test_dry_run_never_invokes_factory(self):
+        eng = _FakeEngine()
+        eng.cfg = EngineConfig(dry_run=True)
+        called = []
+        findings, stats = tls_probe(
+            eng,
+            "203.0.113.9",
+            443,
+            link_factory=lambda ip, port: called.append(1) or _FakeLink([]),
+        )
+        self.assertEqual(findings, [])
+        self.assertEqual(stats["sent"], 0)
+        self.assertEqual(called, [])
 
 
 if __name__ == "__main__":

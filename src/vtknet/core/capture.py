@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 from scapy.all import ARP, ICMP, IP, TCP, AsyncSniffer, rdpcap, wrpcap
 from scapy.packet import Packet
+from scapy.utils import PcapWriter
 from typing_extensions import Self
 
 from vtknet.core.models import utcnow
@@ -33,6 +34,7 @@ class CaptureConfig:
     count: int = 0  # stop after N packets (0 = unlimited)
     timeout: float = 0.0  # stop after N seconds (0 = unlimited; live mode only)
     offline: str | None = None  # read from a pcap file instead of the wire
+    stream_to: str | None = None  # stream every packet to this pcap as it arrives (never OOM)
 
 
 class Capture:
@@ -44,6 +46,11 @@ class Capture:
         self._pkts: deque[Packet] = deque(maxlen=maxlen)
         self._sniffer: AsyncSniffer | None = None
         self._timer: threading.Timer | None = None
+        self._writer: PcapWriter | None = (
+            PcapWriter(self.cfg.stream_to, append=False, sync=True)
+            if self.cfg.stream_to
+            else None
+        )
         self._received = 0
         self._started: str | None = None
         self._stopped: str | None = None
@@ -87,7 +94,7 @@ class Capture:
         return False
 
     def stop(self) -> list[Packet]:
-        """Stop the capture and return the buffered packets."""
+        """Stop the capture (and close any stream writer), return the buffered packets."""
         if self._timer is not None:
             self._timer.cancel()
             self._timer = None
@@ -97,6 +104,10 @@ class Capture:
             except Exception as exc:  # noqa: BLE001 — scapy raises varied types when
                 log.debug("sniffer already stopped: %s", exc)  # count was reached
             self._sniffer = None
+        if self._writer is not None:
+            self._writer.close()
+            self._writer = None
+            log.info("stream pcap closed: %s", self.cfg.stream_to)
         self._stopped = utcnow()
         return list(self._pkts)
 
@@ -111,6 +122,8 @@ class Capture:
     def _on_packet(self, pkt: Packet) -> None:
         self._received += 1
         self._pkts.append(pkt)
+        if self._writer is not None:
+            self._writer.write(pkt)
 
     def packets(self) -> list[Packet]:
         """Snapshot of the buffered packets."""

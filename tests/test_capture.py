@@ -73,5 +73,29 @@ class EngineSendTest(unittest.TestCase):
         e.send([IP(dst="203.0.113.9") / ICMP() for _ in range(3)])
 
 
+class StreamingCaptureTest(unittest.TestCase):
+    def test_stream_to_writes_pcap_while_capturing(self):
+        """Capture with stream_to writes each packet as it arrives — never OOM."""
+        trace, _meta = synthetic.build_trace("tcp_scan", seed=11, count=4)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "stream.pcap")
+            cap = Capture(CaptureConfig(stream_to=path))
+            for p in trace:
+                cap._on_packet(p)
+            cap.stop()  # closes the writer
+            self.assertEqual(len(rdpcap(path)), 4)
+
+    def test_stop_twice_is_safe_with_stream(self):
+        trace, _meta = synthetic.build_trace("syn_flood", seed=2, count=2)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "stream2.pcap")
+            cap = Capture(CaptureConfig(stream_to=path))
+            for p in trace:
+                cap._on_packet(p)
+            cap.stop()
+            cap.stop()  # writer already closed — must not raise
+            self.assertEqual(len(rdpcap(path)), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

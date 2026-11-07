@@ -3,7 +3,6 @@
 [![ci](https://github.com/T9-source/vtknet/actions/workflows/ci.yml/badge.svg)](https://github.com/T9-source/vtknet/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache_2.0-blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%20%7C%203.12-3776AB?logo=python&logoColor=white)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-119%20offline-17A05D)](https://github.com/T9-source/vtknet/actions)
 
 Evidence-driven network testing toolkit built on **Scapy**.
 
@@ -15,9 +14,11 @@ without generating. `vtknet` is one pipeline where **everything is a Scapy
 packet**:
 
 - Modules compose: build → send → capture replies → structured findings.
-- Every finding carries **evidence**: the hex bytes of the packet(s) that prove it.
-- One shared `Engine` controls pacing (rate + jitter), timeouts, retries, dry-run.
-- Output is stable JSON (machine) or a clean summary (human).
+- Every finding carries **evidence**: the hex bytes of the packet(s) that prove it —
+  and `vtk inspect` turns any evidence hex back into readable layers.
+- One shared `Engine` controls pacing (rate + jitter), timeouts, retries, dry-run;
+  stateful conversations run over scapy's `TCP_client` automaton.
+- Output is stable JSON, human summary, or self-contained HTML (`--html`).
 - Everything is reproducible: same seed → same mutants, same traces, same bytes.
 
 **What it is not:** not an nmap replacement for raw speed, not a wireshark
@@ -33,8 +34,8 @@ pip install -e .
 vtk --help
 ```
 
-Raw-socket commands (sweep/arp/scan/tls/fuzz/mitm, live sniff/wifi) need root.
-`synth`, `sniff --offline` and `wifi --offline` never do.
+Raw-socket commands (sweep/arp/scan/tls/quic/fuzz/mitm, live sniff/wifi) need
+root. `synth`, `sniff --offline`, `wifi --offline`, `inspect` and `pcap` never do.
 
 ## Commands
 
@@ -43,13 +44,15 @@ Raw-socket commands (sweep/arp/scan/tls/fuzz/mitm, live sniff/wifi) need root.
 | `sweep` | ICMP host discovery on a CIDR | yes |
 | `arp` | ARP discovery of the local segment | yes |
 | `scan` | TCP SYN/NULL/FIN/XMAS/ACK scan | yes |
-| `tls` | TLS fingerprint: ServerHello version+cipher **and X.509 certificate audit** (expiry → HIGH/LOW severity, self-signed flag) | yes |
+| `tls` | TLS fingerprint via `TCP_client` conversation: ServerHello version+cipher **and X.509 certificate audit** (expiry → severity, self-signed) | yes |
 | `quic` | QUIC reachability via RFC 9000 Version Negotiation (one datagram, no crypto needed) | yes |
-| `sniff` | capture live or read a pcap offline (`--out` pcap) | live only |
-| `synth` | seeded synthetic attack traces (5 scenarios) with JSON sidecars for IDS/rule testing | no |
+| `sniff` | capture live or read a pcap offline; `--out` **streams** to pcap while capturing (never OOM) | live only |
+| `synth` | seeded synthetic attack traces (6 scenarios incl. `frag_evasion`) + JSON sidecars; `--replay IFACE` replays via tcpreplay | no |
 | `fuzz` | seeded header fuzzer (ip/icmp/udp/tcp) with ICMP liveness crash detection — the crashing mutant is saved as evidence | yes |
 | `wifi` | deauth-storm / evil-twin / rogue-AP detection on a monitor iface or offline pcap | live only |
 | `mitm` | ARP poisoning kit with **automatic restore**: correct bindings pushed 3× on exit, ip_forward reverted if we changed it | yes |
+| `inspect` | decode evidence hex / file / pcap bytes back into layers + the exact rebuild command | no |
+| `pcap` | streaming pcap statistics — protocols, top talkers, conversations — without loading the file | no |
 | `plugins` | list discovered plugins (see below) | no |
 
 ## Plugins
@@ -111,7 +114,7 @@ python3 lab/tls_server.py                          # or bare-metal, no Docker
 ## Usage
 
 ```bash
-# discovery + scanning
+# ICMP host discovery on a CIDR
 sudo vtk sweep 192.168.1.0/24
 sudo vtk scan 10.0.0.5 --ports 1-1024 --type syn --rate 200 --json --report out.json
 
@@ -128,9 +131,14 @@ vtk wifi --offline suspicious.pcap --deauth-threshold 5
 # ARP MITM with guaranteed cleanup (lab only) — auto-restores after --duration
 sudo vtk mitm --victim 192.168.1.50 --gateway 192.168.1.1 --duration 60
 
-# detection engineering: generate, replay, verify — reproducibly
+# detection engineering: generate → replay at wire speed → verify — reproducibly
 vtk synth --list
-vtk synth --scenario syn_flood --pcap floods.pcap --count 200 --seed 1337
+vtk synth --scenario frag_evasion --pcap frags.pcap --count 8 --seed 1337
+sudo vtk synth --scenario syn_flood --pcap floods.pcap --count 200 --replay eth0 --pps 1000
+
+# read the evidence back — bytes to layers, both directions
+vtk inspect --hex 4545000c000100004011f96bc0a800016322e34900350035
+vtk pcap frags.pcap
 ```
 
 Common flags (after the subcommand): `--json`, `--report FILE`, `--html FILE`,
