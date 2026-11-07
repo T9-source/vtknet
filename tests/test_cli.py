@@ -213,5 +213,87 @@ class Phase5Test(unittest.TestCase):
             self.assertTrue(os.path.exists(path))
 
 
+class Phase6Test(unittest.TestCase):
+    def _pcap(self, d, scenario="tcp_scan", count=5, seed=1):
+        from vtknet.modules.synthetic import write_trace
+
+        path = os.path.join(d, f"{scenario}-{seed}.pcap")
+        write_trace(scenario, path, seed=seed, count=count)
+        return path
+
+    def test_history_auto_save_and_report(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "h.db")
+            pcap = self._pcap(d)
+            self.assertEqual(main(["--db", db, "pcap", pcap, "--json"]), EXIT_OK)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = main(["--db", db, "report", "--list", "--json"])
+            self.assertEqual(code, EXIT_OK)
+            parsed = json.loads(buf.getvalue())
+            self.assertEqual(parsed["stats"]["runs"], 1)
+
+    def test_history_diff_clean_between_identical_runs(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "h.db")
+            pcap = self._pcap(d)
+            main(["--db", db, "pcap", pcap])
+            main(["--db", db, "pcap", pcap])
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = main(["--db", db, "report", "--diff", "1", "2", "--json"])
+            self.assertEqual(code, EXIT_OK)
+            parsed = json.loads(buf.getvalue())
+            self.assertEqual(parsed["stats"]["added"], 0)
+            self.assertEqual(parsed["stats"]["removed"], 0)
+            self.assertEqual(parsed["stats"]["changed"], 0)  # volatile keys ignored
+
+    def test_history_show_prints_run_json(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "h.db")
+            pcap = self._pcap(d)
+            main(["--db", db, "pcap", pcap])
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = main(["--db", db, "report", "--show", "1", "--json"])
+            self.assertEqual(code, EXIT_OK)
+            parsed = json.loads(buf.getvalue())
+            run = parsed["findings"][0]["detail"]
+            self.assertEqual(run["id"], 1)
+            self.assertEqual(run["command"], "pcap")
+
+    def test_dry_run_never_saves(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "h.db")
+            main(["--db", db, "scan", "127.0.0.1", "--ports", "80", "--dry-run"])
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                main(["--db", db, "report", "--list", "--json"])
+            parsed = json.loads(buf.getvalue())
+            self.assertEqual(parsed["stats"]["runs"], 0)
+
+    def test_no_save_flag_respected(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "h.db")
+            pcap = self._pcap(d)
+            main(["--db", db, "--no-save", "pcap", pcap])
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                main(["--db", db, "report", "--list", "--json"])
+            parsed = json.loads(buf.getvalue())
+            self.assertEqual(parsed["stats"]["runs"], 0)
+
+    def test_dns_and_dhcp_dry_run(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(main(["dns", "example.com", "--dry-run"]), EXIT_OK)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(main(["dhcp", "--dry-run"]), EXIT_OK)
+
+    def test_dns_requires_two_resolvers(self):
+        self.assertEqual(main(["dns", "example.com", "--resolvers", "1.1.1.1"]), EXIT_USAGE)
+
+
 if __name__ == "__main__":
     unittest.main()

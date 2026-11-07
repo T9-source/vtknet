@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -15,7 +16,19 @@ from vtknet.core import report
 from vtknet.core.capture import Capture, CaptureConfig
 from vtknet.core.engine import Engine, EngineConfig
 from vtknet.core.models import Finding, ScanResult, Severity
-from vtknet.modules import fuzz, mitm, quicprobe, recon, scanner, synthetic, tlsprobe, wifi
+from vtknet.core.store import DEFAULT_DB, History
+from vtknet.modules import (
+    dhcpprobe,
+    dnsprobe,
+    fuzz,
+    mitm,
+    quicprobe,
+    recon,
+    scanner,
+    synthetic,
+    tlsprobe,
+    wifi,
+)
 from vtknet.utils import net
 
 log = logging.getLogger("vtknet.cli")
@@ -23,6 +36,22 @@ log = logging.getLogger("vtknet.cli")
 EXIT_OK = 0
 EXIT_RUNTIME = 1
 EXIT_USAGE = 2
+
+# commands whose findings are network truth worth persisting
+AUTO_SAVE_COMMANDS = {
+    "sweep",
+    "arp",
+    "scan",
+    "tls",
+    "quic",
+    "sniff",
+    "fuzz",
+    "wifi",
+    "mitm",
+    "pcap",
+    "dns",
+    "dhcp",
+}
 
 BUILTIN_COMMANDS = {
     "sweep",
@@ -37,6 +66,9 @@ BUILTIN_COMMANDS = {
     "mitm",
     "inspect",
     "pcap",
+    "report",
+    "dns",
+    "dhcp",
     "plugins",
 }
 
@@ -72,6 +104,12 @@ def build_parser(plugin_dirs: list[str] | None = None) -> argparse.ArgumentParse
         default=None,
         metavar="DIR",
         help="load local plugins (*.py VtkPlugin classes) from DIR (repeatable)",
+    )
+    parser.add_argument(
+        "--db", default=None, metavar="FILE", help=f"history database path (default: {DEFAULT_DB})"
+    )
+    parser.add_argument(
+        "--no-save", action="store_true", help="do not persist this run to the history database"
     )
 
     common = argparse.ArgumentParser(add_help=False)
@@ -147,6 +185,29 @@ def build_parser(plugin_dirs: list[str] | None = None) -> argparse.ArgumentParse
     )
     p_pcap.add_argument("pcap_file", help="pcap file to summarize")
 
+    p_report = sub.add_parser(
+        "report", parents=[common], help="query the run history: list, show, or diff two runs (offline)"
+    )
+    p_report.add_argument("--list", action="store_true", help="list recent runs")
+    p_report.add_argument("--show", metavar="RUN_ID", type=int, help="print the full JSON of a run")
+    p_report.add_argument(
+        "--diff", metavar=("RUN_A", "RUN_B"), nargs=2, type=int, help="added/removed/changed between runs"
+    )
+
+    p_dns = sub.add_parser(
+        "dns", parents=[common], help="ask several resolvers the same question — divergence = suspected spoofing"
+    )
+    p_dns.add_argument("name", help="domain name to resolve")
+    p_dns.add_argument(
+        "--resolvers", default=",".join(dnsprobe.DEFAULT_RESOLVERS), help="comma-separated resolver IPs"
+    )
+    p_dns.add_argument("--qtype", default="A", help="record type: A | AAAA | PTR | TXT (default A)")
+
+    p_dhcp = sub.add_parser(
+        "dhcp", parents=[common], help="broadcast a discover and classify every offer — rogue-server detection"
+    )
+    p_dhcp.add_argument("--known-server", default=None, help="the trusted DHCP server IP (any other offer = rogue)")
+
     p_fuzz = sub.add_parser(
         "fuzz", parents=[common], help="seeded protocol fuzzer with liveness crash detection"
     )
@@ -194,7 +255,7 @@ def build_parser(plugin_dirs: list[str] | None = None) -> argparse.ArgumentParse
 
 def _needs_raw_sockets(args: argparse.Namespace) -> bool:
     """Commands that touch raw sockets (offline modes and synth need no privileges)."""
-    if args.command in ("inspect", "pcap", "plugins"):
+    if args.command in ("inspect", "pcap", "plugins", "report"):
         return False
     if args.command == "synth":
         return bool(getattr(args, "replay", None))  # tcpreplay sends on a real iface
@@ -370,6 +431,68 @@ def _run_pcap(args: argparse.Namespace, result: ScanResult) -> None:
     result.stats = {"packets": summary["packets"]}
 
 
+def _run_report(args: argparse.Namespace, result: ScanResult) -> None:
+    history = History(args.db or DEFAULT_DB)
+    try:
+        if args.show is not None:
+            run = history.get_run(args.show)
+            if run is None:
+                raise ValueError(f"unknown run id: {args.show}")
+            if args.json:
+                result.findings = [
+                    Finding(module="report", kind="run.show", host=f"run-{run['id']}", detail=run)
+                ]
+            else:
+                print(json.dumps(run, indent=2, ensure_ascii=False))
+            result.stats = {"findings": len(run["findings"])}
+            return
+        if args.diff is not None:
+            run_a, run_b = args.diff
+            d = history.diff(run_a, run_b)
+            result.findings = [
+                Finding(
+                    module="report",
+                    kind=f"diff.{category}",
+                    host=item["host"],
+                    port=item["port"],
+                    severity=(
+                        Severity.LOW
+                        if category == "added" and item["kind"] == "port.open"
+                        else Severity.INFO
+                    ),
+                    detail=item,
+                )
+                for category in ("added", "removed", "changed")
+                for item in d[category]
+            ]
+            result.stats = {
+                "added": len(d["added"]),
+                "removed": len(d["removed"]),
+                "changed": len(d["changed"]),
+            }
+            return
+        # default / --list
+        runs = history.list_runs()
+        if not args.json:
+            print(f"{'id':>4}  {'command':<10} {'findings':>8}  started")
+            for r in runs:
+                print(f"{r['id']:>4}  {r['command']:<10} {r['findings']:>8}  {r['started']}")
+        result.stats = {"runs": len(runs)}
+    finally:
+        history.close()
+
+
+def _run_dns(args: argparse.Namespace, engine: Engine, result: ScanResult) -> None:
+    resolvers = [r.strip() for r in args.resolvers.split(",") if r.strip()]
+    if len(resolvers) < 2:
+        raise ValueError("dns needs at least 2 resolvers to compare (use --resolvers a,b,c)")
+    result.findings, result.stats = dnsprobe.dns_probe(engine, args.name, resolvers, args.qtype)
+
+
+def _run_dhcp(args: argparse.Namespace, engine: Engine, result: ScanResult) -> None:
+    result.findings, result.stats = dhcpprobe.dhcp_probe(engine, known_server=args.known_server)
+
+
 def _run_fuzz(args: argparse.Namespace, engine: Engine, result: ScanResult) -> None:
     if len(args.target.split(",")) > 1:
         raise ValueError("fuzz expects a single host")
@@ -541,6 +664,12 @@ def _run(args: argparse.Namespace) -> ScanResult:
         _run_inspect(args, result)
     elif args.command == "pcap":
         _run_pcap(args, result)
+    elif args.command == "report":
+        _run_report(args, result)
+    elif args.command == "dns":
+        _run_dns(args, engine, result)
+    elif args.command == "dhcp":
+        _run_dhcp(args, engine, result)
     else:  # pragma: no cover — argparse enforces choices
         raise ValueError(f"unknown command: {args.command}")
     result.finish(time.monotonic() - started)
@@ -565,6 +694,13 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         log.error("interrupted by user")
         return EXIT_RUNTIME
+
+    # temporal memory: persist every network-truth run (never dry-runs/synth/inspect)
+    if not args.no_save and not args.dry_run and args.command in AUTO_SAVE_COMMANDS:
+        try:
+            History(args.db or DEFAULT_DB).save_result(result)
+        except Exception as exc:  # noqa: BLE001 — history failure must not kill the run
+            log.warning("history save failed: %s", exc)
 
     if args.report:
         try:
