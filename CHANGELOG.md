@@ -1,5 +1,100 @@
 # Changelog
 
+## 0.8.0 — unreleased (Sprint 1: chain of custody + registry + DX)
+
+- **Evidence SHA-256**: every `Evidence` stamps its own SHA-256 at creation
+  (`core/models.py`) — the first link of the verify/sign chain; the hash
+  travels in JSON, HTML and SARIF output.
+- **`vtk kinds`**: central finding-kind registry (`core/kinds.py`) — one
+  meaning + default severity + reference per kind; `--schema` emits a
+  draft-07 JSON Schema of the findings payload; plugins register via
+  `register_kind()` (builtins never shadowed).
+- **`report --diff :last`**: diff against the most recent run of the same
+  command+target (`:last-N` walks further back) — diff-by-default without
+  remembering run ids (`History.find_last_run`).
+- **SARIF 2.1.0 export** (`--sarif FILE`): findings land directly in the
+  GitHub Security tab; severity → level mapping, evidence hash in result
+  properties.
+- **`--dry-run --emit out.pcap`**: dry-runs write the packets that *would*
+  be sent to a reviewable pcap — L3 probes framed with placeholder MACs so
+  no neighbor resolution (no traffic) ever happens during a dry-run.
+- **`vtk banner`**: service-first-bytes grabbing over the `TCP_client`
+  automaton — banner text + raw bytes as hex evidence; `banner.no-data`
+  marks client-speaks-first services (probe those with `tls`).
+- **PQ-TLS probe v1** (`tls --pq`, `--force-fragment`): ClientHello
+  offering X25519MLKEM768 (hello ~1.4 KB) and a padded past-MTU variant —
+  detects servers/paths that break on post-quantum or fragmented
+  ClientHellos. v1 uses a deterministic dummy key_share: ServerHello/alert
+  detection is valid, no hybrid handshake completes.
+- New kinds registered: `banner.*`, `tls.pq.*`, `kinds.*`.
+- **Review pass — PQ probe corrected and upgraded**: the MLKEM group constant
+  was the decimal 4588 mis-hexed as `0x4588` (an unassigned IANA group that
+  made every reply look post-quantum); it is now the real code point
+  `0x11EC`. The probe reads the server-SELECTED key_share group back from
+  the ServerHello (`parse_serverhello_selected_group`, pure byte walk):
+  `tls.pq.negotiated` now means the server genuinely chose X25519MLKEM768,
+  while a classical selection lands in the new `tls.pq.fallback` kind —
+  both carry `pq_selected_group`/`pq_confirmed` in detail. The ClientHello
+  now mirrors the real RFC 10024 / Chrome wire shape: MLKEM768 listed FIRST
+  in supported_groups (client preference) and ONE 1216-byte hybrid client
+  share (1184B ML-KEM-768 ek, then 32B x25519 — reversed order per RFC
+  10024 §3.2) instead of two separate entries.
+- **Review pass — bounded link reads**: scapy automaton `recv()` has no
+  timeout, so a server that accepts and stays silent could hang a probe
+  forever. `core/converse.link_recv_bounded` enforces the deadline from
+  the caller's side (helper read + close-underneath unblock); `banner`
+  and the PQ probe use it with `engine.cfg.timeout`.
+- **`vtk verify REPORT.json`**: the chain of custody closes — every
+  evidence hash is re-derived from the bytes as they stand now
+  (`verify.tampered`, high, on mismatch), unregistered finding kinds are
+  flagged against the kinds registry (`verify.unknown-kind`), and a
+  `verify.summary` finding carries the totals. Pre-0.8.0 reports (no
+  stored hashes) count as `no_hash` instead of failing. Offline, no root.
+- **Out-of-the-box round §11 (IDEAS.md)** — five ideas shipped:
+  - **Merkle-ized findings / selective disclosure**: every signed envelope
+    carries `vtknetMerkleRoot` (Merkle root over all evidence hashes);
+    `vtk verify --prove FINDING_ID` emits a Certificate-Transparency-style
+    inclusion proof — share ONE finding with a third party without
+    disclosing the rest of the report. No scanner or attestation tool
+    offers this.
+  - **`vtk replay`**: evidence is executable — re-send the exact bytes a
+    finding was proven with (the crashing fuzz mutant, the anomalous
+    probe) through the Engine, dry-run aware, DSSE reports verified
+    before replay.
+  - **`vtk assert`**: the network as desired-state — JSON rules of promises
+    ("port 443 present", "no rogue DHCP"), evaluated against any report;
+    exit 1 on violation = the CI-gate contract. Compose live mode with
+    the Unix pipeline.
+  - **blindspots**: every scan/sweep/tls/banner run now declares the
+    boundaries of its own knowledge (`blindspot.*` findings — filtered
+    ports, silent hosts, unknown cert health). The most honest report in
+    the market: quantified ignorance, not manufactured omniscience.
+  - **`vtk ledger`**: double-entry bookkeeping for the wire — every packet
+    addressed to us is a credit, our probes are the debits; unaccounted
+    talkers ("the network spoke first") become findings with packet
+    evidence. Offline pcap or live capture; hostile floods capped.
+- **SARIF upgraded to GitHub-grade** (research-driven): results now carry
+  the stable cross-run fingerprint in `partialFingerprints`
+  (`primaryLocationLineHash` — the only key GitHub reads for alert dedup —
+  plus a versioned `vtknetFindingHash/v1`) and a deterministic
+  `correlationGuid`; a per-run uuid there would close/reopen alerts every
+  scan. Locations use deterministic `tcp://host:port` artifact URIs
+  (SARIF §3.4.7), rule metadata (descriptions + help +
+  `security-severity` CVSS-like buckets) is generated from the kinds
+  registry — no other scanner emits all of this (Semgrep/Trivy ship no
+  stable fingerprints at all).
+- **`vtk keygen` / `vtk sign` — DSSE-signed reports (Ed25519)**: the
+  first network scanner with standards-grade tamper-evident output.
+  Reports are wrapped in DSSE v1 envelopes (`report.json.dsse`,
+  payloadType `application/vnd.vtknet.report.v1+json`), signed over the
+  PAE bytes exactly per the DSSE spec; signing is reproducible
+  (canonical JSON). `vtk verify` accepts envelopes and fails closed —
+  a bad signature is an error, never a warning. Keypairs land in
+  `~/.vtknet/keys/<keyid>.key|.pub` (0600 private); keyid = sha256 of
+  the DER public key. The chain of custody is now end-to-end:
+  evidence stamped at birth → envelope signed → verify re-derives
+  signature AND every evidence hash.
+
 ## 0.7.0 — speed + hostile-input hardening
 
 - **Concurrent engine**: `--workers N` runs sr() batches on a thread pool

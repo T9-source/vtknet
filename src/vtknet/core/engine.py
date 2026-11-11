@@ -28,6 +28,7 @@ class EngineConfig:
     batch_size: int = 64  # packets per sr() call when pacing
     workers: int = 1  # parallel sr() workers over batches (1 = sequential, no threads)
     dry_run: bool = False  # build packets, send nothing
+    emit: str | None = None  # dry-run companion: write the built packets to this pcap
 
 
 class Engine:
@@ -133,13 +134,46 @@ class Engine:
         """Fire-and-forget send (no reply collection). Honors dry-run."""
         if self.cfg.dry_run:
             single = isinstance(pkts, Packet)
-            for p in [pkts] if single else pkts:
+            plist = [pkts] if single else list(pkts)
+            for p in plist:
                 log.info("dry-run: %s", p.summary())
+            self._emit_pcap(plist)
             return
         fn = sendp if l2 else send
         fn(pkts, iface=self.cfg.iface, inter=self._inter(), verbose=0)
 
     # -- internals -------------------------------------------------------
+
+    def _emit_pcap(self, pkts: list[Packet]) -> None:
+        """Dry-run companion: write the built packets to ``cfg.emit`` for review.
+
+        Evidence discipline before the first byte leaves the host: what was
+        *about to* go on the wire becomes a reviewable pcap. L2 packets are
+        written as-is; L3 packets are framed with a fake Ethernet header so
+        every reader can open the file.
+        """
+        if not self.cfg.emit or not pkts:
+            return
+        from scapy.all import Ether
+        from scapy.utils import PcapWriter  # local: writer is needed only here
+
+        framed: list[Packet] = []
+        for p in pkts:
+            if p.haslayer(Ether):
+                framed.append(p)
+            else:
+                # explicit placeholder MACs — a bare Ether() would trigger scapy
+                # neighbor resolution (real ARP frames) at build time, and a
+                # dry-run must never generate traffic
+                framed.append(Ether(src="00:00:00:00:00:00", dst="ff:ff:ff:ff:ff:ff") / p)
+        try:
+            w = PcapWriter(self.cfg.emit, append=False, sync=True)
+            for p in framed:
+                w.write(p)
+            w.close()
+            log.info("dry-run emit: %d packet(s) written to %s", len(framed), self.cfg.emit)
+        except OSError as exc:
+            log.warning("dry-run emit failed (%s): %s", self.cfg.emit, exc)
 
     def _dry_run(
         self, pkts: list[Packet]
@@ -150,4 +184,5 @@ class Engine:
             log.info("dry-run: %s", p.summary())
         if len(pkts) > 10:
             log.info("dry-run: ... and %d more", len(pkts) - 10)
+        self._emit_pcap(pkts)
         return [], list(pkts)

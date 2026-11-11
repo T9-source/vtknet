@@ -171,6 +171,33 @@ class History:
             ],
         }
 
+    def find_last_run(
+        self, command: str, target: str | None = None, before_id: int | None = None
+    ) -> int | None:
+        """Most recent run id for ``command`` (optionally same target, before a run).
+
+        ``target`` is matched against the stored args ("target", then
+        "name" for dns) as an exact string — the stable target key the CLI
+        exposes. Returns None when nothing matches.
+        """
+        rows = self._conn.execute(
+            "SELECT id, args_json FROM runs WHERE command = ? ORDER BY id DESC LIMIT 500",
+            (command,),
+        ).fetchall()
+        for rid, args_json in rows:
+            if before_id is not None and rid >= before_id:
+                continue
+            if target is not None:
+                try:
+                    stored = json.loads(args_json)
+                except json.JSONDecodeError:
+                    continue
+                matches = any(stored.get(k) == target for k in ("target", "name"))
+                if not matches:
+                    continue
+            return rid
+        return None
+
     # -- diffing -------------------------------------------------------------
 
     def diff(self, run_a: int, run_b: int) -> dict[str, Any]:

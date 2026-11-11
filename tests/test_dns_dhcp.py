@@ -47,6 +47,26 @@ class DnsBuilderTest(unittest.TestCase):
         )
         self.assertEqual(extract_answers(reply), ["192.0.2.7", "192.0.2.8"])
 
+    def test_extract_answers_dissected_reply(self):
+        # Real-world shape: bytes off the wire are re-dissected. scapy>=2.8
+        # holds the RRs in the PacketListField view, not as a payload chain.
+        reply = IP(src="192.0.2.53") / UDP(sport=53, dport=53535) / DNS(
+            qr=1, ancount=2, qd=DNSQR(qname=LAB_NAME),
+            an=DNSRR(rrname=LAB_NAME, rdata="192.0.2.7") / DNSRR(rrname=LAB_NAME, rdata="192.0.2.8"),
+        )
+        self.assertEqual(extract_answers(IP(bytes(reply))), ["192.0.2.7", "192.0.2.8"])
+
+    def test_extract_answers_forged_ancount(self):
+        # Hostile input: declared ancount far exceeds the RRs actually sent —
+        # return what is present, never crash on the missing tail.
+        reply = IP(src="192.0.2.53") / UDP(sport=53, dport=53535) / DNS(
+            qr=1, ancount=9, qd=DNSQR(qname=LAB_NAME),
+            an=DNSRR(rrname=LAB_NAME, rdata="192.0.2.7") / DNSRR(rrname=LAB_NAME, rdata="192.0.2.8"),
+        )
+        self.assertEqual(
+            extract_answers(IP(bytes(reply))), ["192.0.2.7", "192.0.2.8"]
+        )
+
     def test_non_dns_reply_is_empty(self):
         self.assertEqual(extract_answers(IP(src="192.0.2.53") / UDP(sport=53) / b"nope"), [])
 

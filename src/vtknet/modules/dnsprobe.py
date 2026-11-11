@@ -28,17 +28,38 @@ def dns_query_packet(name: str, resolver: str, qtype: str = "A", sport: int = 53
 
 
 def extract_answers(reply: Packet) -> list[str]:
-    """Walk the chained answer RRs of a DNS reply into a list of rdata strings."""
+    """Collect the rdata strings of a DNS reply's answer section.
+
+    Handles both scapy>=2.8 (``DNS.an`` is a PacketListField: a list of RRs,
+    complete on dissected packets) and older versions (RRs chained as
+    payloads). Never trusts the declared ``ancount`` past the RRs actually
+    present — a forged oversized count yields what is there, not a crash.
+    """
     if not reply.haslayer(DNS):
         return []
     d = reply[DNS]
+    an = d.an
+    if an is None:
+        return []
+    count = int(d.ancount or 0)
+    answers: list[str] | None = None
+    if isinstance(an, (list, tuple)):
+        answers = [str(rr.rdata) for rr in an]
+        if len(answers) >= count:
+            return answers
+        # In-memory-built packets may leave later RRs as payloads of the
+        # first one instead of absorbing them into the list view.
+        rr: Packet | None = an[0] if answers else None
+    else:  # scapy<2.8: one Packet, RRs chained as payloads
+        rr = an
     out: list[str] = []
-    rr = d.an
-    for _ in range(d.ancount):
-        if rr is None:
-            break
+    while rr is not None and len(out) < count and hasattr(rr, "rdata"):
         out.append(str(rr.rdata))
         rr = rr.payload
+    # A forged oversized ancount truncates the payload chain walk (dissected
+    # RRs are not chained); the list view is then the fuller truth.
+    if answers and len(out) < len(answers):
+        return answers
     return out
 
 

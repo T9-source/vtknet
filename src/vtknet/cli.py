@@ -10,14 +10,22 @@ import sys
 import time
 
 import vtknet
+from vtknet.core import assertions as assertions_mod
+from vtknet.core import blindspot as blindspot_mod
 from vtknet.core import inspect as inspect_mod
+from vtknet.core import ledger as ledger_mod
 from vtknet.core import plugins as plugins_mod
+from vtknet.core import replay as replay_mod
 from vtknet.core import report
+from vtknet.core import signing as signing_mod
+from vtknet.core import verify as verify_mod
 from vtknet.core.capture import Capture, CaptureConfig
 from vtknet.core.engine import Engine, EngineConfig
+from vtknet.core.kinds import kinds_schema, render_kinds_text
 from vtknet.core.models import Finding, ScanResult, Severity
 from vtknet.core.store import DEFAULT_DB, History
 from vtknet.modules import (
+    banner,
     dhcpprobe,
     dnsprobe,
     fuzz,
@@ -51,6 +59,8 @@ AUTO_SAVE_COMMANDS = {
     "pcap",
     "dns",
     "dhcp",
+    "ledger",
+    "banner",
 }
 
 BUILTIN_COMMANDS = {
@@ -69,6 +79,14 @@ BUILTIN_COMMANDS = {
     "report",
     "dns",
     "dhcp",
+    "banner",
+    "kinds",
+    "verify",
+    "keygen",
+    "sign",
+    "replay",
+    "assert",
+    "ledger",
     "plugins",
 }
 
@@ -127,6 +145,14 @@ def build_parser(plugin_dirs: list[str] | None = None) -> argparse.ArgumentParse
     common.add_argument("--json", action="store_true", help="emit machine-readable JSON report")
     common.add_argument("--report", metavar="FILE", help="also write the JSON report to FILE")
     common.add_argument("--html", metavar="FILE", help="also write a self-contained HTML report to FILE")
+    common.add_argument(
+        "--sarif", metavar="FILE", help="also write a SARIF 2.1.0 report (GitHub Security tab)"
+    )
+    common.add_argument(
+        "--emit",
+        metavar="PCAP",
+        help="with --dry-run: write the packets that WOULD be sent to PCAP for review",
+    )
     common.add_argument("--dry-run", action="store_true", help="build packets without sending anything")
     common.add_argument("-v", "--verbose", action="count", default=0, help="verbose logging (-v, -vv)")
 
@@ -149,6 +175,29 @@ def build_parser(plugin_dirs: list[str] | None = None) -> argparse.ArgumentParse
     p_tls.add_argument("target", help="IP or hostname (single host)")
     p_tls.add_argument("--port", type=int, default=443, help="TLS port (default 443)")
     p_tls.add_argument("--sni", default=None, help="SNI hostname (default: the target)")
+    p_tls.add_argument(
+        "--pq",
+        action="store_true",
+        help="post-quantum hybrid probe: ClientHello offers X25519MLKEM768 (v1)",
+    )
+    p_tls.add_argument(
+        "--force-fragment",
+        action="store_true",
+        help="pad the PQ ClientHello past the MTU (fragmented-CH compatibility test)",
+    )
+
+    p_banner = sub.add_parser(
+        "banner", parents=[common], help="grab the first bytes a service sends (TCP conversation)"
+    )
+    p_banner.add_argument("target", help="IP or hostname (single host)")
+    p_banner.add_argument("--port", type=int, default=80, help="port to probe (default 80)")
+
+    p_kinds = sub.add_parser(
+        "kinds", parents=[common], help="list all finding kinds (registry) or emit their JSON Schema"
+    )
+    p_kinds.add_argument(
+        "--schema", action="store_true", help="emit JSON Schema for the findings payload instead of the table"
+    )
 
     p_quic = sub.add_parser(
         "quic", parents=[common], help="QUIC reachability via RFC 9000 version negotiation"
@@ -197,8 +246,76 @@ def build_parser(plugin_dirs: list[str] | None = None) -> argparse.ArgumentParse
     p_report.add_argument("--list", action="store_true", help="list recent runs")
     p_report.add_argument("--show", metavar="RUN_ID", type=int, help="print the full JSON of a run")
     p_report.add_argument(
-        "--diff", metavar=("RUN_A", "RUN_B"), nargs=2, type=int, help="added/removed/changed between runs"
+        "--diff",
+        metavar=("RUN_A", "RUN_B"),
+        nargs=2,
+        help="added/removed/changed between runs (ids, or ':last' / ':last-N' = recent runs of the same command+target)",
     )
+
+    p_verify = sub.add_parser(
+        "verify", parents=[common], help="re-check every evidence hash in a saved report (offline)"
+    )
+    p_verify.add_argument("report_file", help="saved JSON report (plain or .dsse envelope) to verify")
+    p_verify.add_argument(
+        "--key",
+        metavar="PUB",
+        default=None,
+        help="trusted Ed25519 public key (.pub) for signed envelopes (default: newest in ~/.vtknet/keys)",
+    )
+    p_verify.add_argument(
+        "--prove",
+        metavar="FINDING_ID",
+        default=None,
+        help="emit a Merkle inclusion proof for one finding — share a single result without the rest",
+    )
+
+    p_keygen = sub.add_parser(
+        "keygen", parents=[common], help="generate an Ed25519 signing keypair for report signing"
+    )
+    p_keygen.add_argument(
+        "--out-dir", metavar="DIR", default=None, help=f"key directory (default: {signing_mod.DEFAULT_KEYS_DIR})"
+    )
+
+    p_sign = sub.add_parser(
+        "sign", parents=[common], help="DSSE-sign a saved report (Ed25519) — tamper-evident attestation"
+    )
+    p_sign.add_argument("report_file", help="saved JSON report to sign")
+    p_sign.add_argument(
+        "--key",
+        metavar="KEY",
+        default=None,
+        help="Ed25519 private key (.key) (default: newest in ~/.vtknet/keys)",
+    )
+
+    p_replay = sub.add_parser(
+        "replay",
+        parents=[common],
+        help="re-send the exact evidence bytes of one finding (evidence is executable)",
+    )
+    p_replay.add_argument("report_file", help="saved JSON report (plain or .dsse)")
+    p_replay.add_argument("--finding", required=True, metavar="ID", help="finding id whose evidence to replay")
+    p_replay.add_argument("--count", type=int, default=1, help="how many times to send (default 1)")
+    p_replay.add_argument(
+        "--key", metavar="PUB", default=None,
+        help="public key for .dsse reports (default: newest in ~/.vtknet/keys)",
+    )
+
+    p_assertcmd = sub.add_parser(
+        "assert",
+        parents=[common],
+        help="evaluate desired-state assertions against a report (exit 1 on any violation)",
+    )
+    p_assertcmd.add_argument("rules_file", help="assertion rules JSON")
+    p_assertcmd.add_argument("--against", required=True, metavar="REPORT", help="report to evaluate against")
+
+    p_ledger = sub.add_parser(
+        "ledger",
+        parents=[common],
+        help="audit who talked to us unasked — double-entry reconciliation of the wire",
+    )
+    p_ledger.add_argument("--offline", metavar="PCAP", help="audit a capture file instead of the wire (no root)")
+    p_ledger.add_argument("--duration", type=float, default=None, help="live capture seconds (default: --timeout)")
+    p_ledger.add_argument("--count", type=int, default=0, help="stop after N packets (live, 0 = unlimited)")
 
     p_dns = sub.add_parser(
         "dns", parents=[common], help="ask several resolvers the same question — divergence = suspected spoofing"
@@ -261,12 +378,18 @@ def build_parser(plugin_dirs: list[str] | None = None) -> argparse.ArgumentParse
 
 def _needs_raw_sockets(args: argparse.Namespace) -> bool:
     """Commands that touch raw sockets (offline modes and synth need no privileges)."""
-    if args.command in ("inspect", "pcap", "plugins", "report"):
+    if args.command in (
+        "inspect", "pcap", "plugins", "report", "kinds", "verify", "keygen", "sign", "assert"
+    ):
         return False
+    if args.command == "ledger":
+        return getattr(args, "offline", None) is None  # offline audit needs no privileges
     if args.command == "synth":
         return bool(getattr(args, "replay", None))  # tcpreplay sends on a real iface
     if args.command in ("sniff", "wifi"):
         return args.offline is None
+    if args.command == "banner":
+        return not args.dry_run  # TCP_client raw conversation (like tls)
     return True  # builtins and plugins may send raw packets; warn conservatively
 
 
@@ -284,8 +407,48 @@ def _run_tls(args: argparse.Namespace, engine: Engine, result: ScanResult) -> No
     dst = net.resolve_host(args.target)
     if dst != args.target:
         log.info("resolved %s -> %s", args.target, dst)
-    findings, stats = tlsprobe.tls_probe(engine, dst, port=args.port, sni=args.sni)
+    findings, stats = tlsprobe.tls_probe(
+        engine,
+        dst,
+        port=args.port,
+        sni=args.sni,
+        pq=getattr(args, "pq", False),
+        force_fragment=getattr(args, "force_fragment", False),
+    )
     result.findings, result.stats = findings, stats
+
+
+def _run_banner(args: argparse.Namespace, engine: Engine, result: ScanResult) -> None:
+    if len(args.target.split(",")) > 1:
+        raise ValueError("banner expects a single host")
+    dst = net.resolve_host(args.target)
+    if dst != args.target:
+        log.info("resolved %s -> %s", args.target, dst)
+    result.findings, result.stats = banner.banner_grab(engine, dst, port=args.port)
+
+
+def _run_kinds(args: argparse.Namespace, result: ScanResult) -> None:
+    from vtknet.core import kinds as kinds_mod
+
+    if args.schema:
+        result.findings = [
+            Finding(
+                module="kinds",
+                kind="kinds.schema",
+                host="-",
+                detail=kinds_schema(),
+            )
+        ]
+    else:
+        result.findings = [
+            Finding(
+                module="kinds",
+                kind="kinds.registry",
+                host="-",
+                detail={"count": len(kinds_mod.KINDS), "table": render_kinds_text()},
+            )
+        ]
+    result.stats = {"kinds": len(kinds_mod.KINDS)}
 
 
 def _run_sniff(args: argparse.Namespace, result: ScanResult) -> None:
@@ -424,6 +587,179 @@ def vtknet_capture_iter(path: str):
     return iter_pcap(path)
 
 
+def _newest_key(directory, pattern: str):
+    """Newest matching key file in the keys dir (mtime order)."""
+    from pathlib import Path
+
+    keys = sorted(Path(directory).glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not keys:
+        raise ValueError(f"no {pattern} found in {directory} — run 'vtk keygen' first")
+    return str(keys[0])
+
+
+def _run_verify(args: argparse.Namespace, result: ScanResult) -> None:
+    import json
+    from pathlib import Path
+
+    try:
+        text = Path(args.report_file).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"cannot read report ({args.report_file}): {exc}") from exc
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"not a valid vtknet JSON report ({args.report_file}): {exc}") from exc
+
+    extra: list[Finding] = []
+    if signing_mod.is_envelope(parsed):
+        key = args.key or _newest_key(signing_mod.DEFAULT_KEYS_DIR, "*.pub")
+        body = signing_mod.verify_envelope(parsed, key)  # fail closed -> ValueError
+        report = json.loads(body)
+        extra = [
+            Finding(
+                module="sign",
+                kind="verify.signature",
+                host="-",
+                detail={
+                    "verified": True,
+                    "keyid": parsed["signatures"][0].get("keyid", ""),
+                    "payload_type": parsed.get("payloadType", ""),
+                },
+            )
+        ]
+    else:
+        if not isinstance(parsed, dict) or "findings" not in parsed:
+            raise ValueError(f"not a vtknet report (missing 'findings'): {args.report_file}")
+        report = parsed
+
+    if getattr(args, "prove", None):
+        proof = signing_mod.finding_inclusion_proof(report, args.prove)
+        if proof is None:
+            raise ValueError(f"finding {args.prove!r} has no evidence in this report")
+        result.findings = [Finding(module="sign", kind="verify.proof", host="-", detail=proof)]
+        result.stats = {"proved": 1, "verified": int(proof["verified"])}
+        if not args.json:
+            print(json.dumps(proof, indent=2))
+        return
+
+    findings, stats = verify_mod.verify_report(report)
+    result.findings = extra + findings
+    result.stats = stats
+    if not args.json:
+        s = findings[0].detail
+        sig = "signed+verified " if extra else ""
+        print(
+            f"verify {args.report_file}: {sig}{s['evidences']} evidence(s) — "
+            f"hash-ok={s['hashed_ok']} tampered={s['tampered']} "
+            f"unhashed={s['no_hash']} unknown-kinds={s['unknown_kind']}"
+        )
+
+
+def _run_keygen(args: argparse.Namespace, result: ScanResult) -> None:
+    priv, pub, keyid = signing_mod.keygen(args.out_dir or signing_mod.DEFAULT_KEYS_DIR)
+    result.findings = [
+        Finding(
+            module="sign",
+            kind="keys.generated",
+            host="-",
+            detail={"private": str(priv), "public": str(pub), "keyid": keyid},
+        )
+    ]
+    result.stats = {"keys": 1}
+    if not args.json:
+        print(f"keypair written: {priv} (+ {pub}) — keyid {keyid}")
+
+
+def _run_sign(args: argparse.Namespace, result: ScanResult) -> None:
+    import json
+    from pathlib import Path
+
+    path = Path(args.report_file)
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"cannot read report ({path}): {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"not a valid vtknet JSON report ({path}): {exc}") from exc
+    key = args.key or _newest_key(signing_mod.DEFAULT_KEYS_DIR, "*.key")
+    envelope = signing_mod.sign_report(report, key)
+    out = Path(str(path) + ".dsse")
+    out.write_text(json.dumps(envelope, indent=2), encoding="utf-8")
+    keyid = envelope["signatures"][0]["keyid"]
+    result.findings = [
+        Finding(
+            module="sign",
+            kind="report.signed",
+            host=str(path),
+            detail={"envelope": str(out), "keyid": keyid, "payload_type": envelope["payloadType"]},
+        )
+    ]
+    result.stats = {"signed": 1}
+    log.info("DSSE envelope written to %s (keyid %s)", out, keyid)
+    if not args.json:
+        print(f"signed -> {out} (keyid {keyid})")
+
+
+def _run_replay(args: argparse.Namespace, engine: Engine, result: ScanResult) -> None:
+    report = replay_mod.load_report(args.report_file, pub=args.key)
+    evidence_hex = replay_mod.find_finding_evidence(report, args.finding)
+    result.findings, result.stats = replay_mod.replay_finding(
+        engine, evidence_hex, count=args.count
+    )
+    if not args.json:
+        print(f"replayed finding {args.finding}: {result.stats['sent']} send(s)")
+
+
+def _run_assert(args: argparse.Namespace, result: ScanResult) -> None:
+    import json as _json
+    from pathlib import Path
+
+    rules = assertions_mod.load_rules(args.rules_file)
+    try:
+        report = _json.loads(Path(args.against).read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"cannot read report ({args.against}): {exc}") from exc
+    except _json.JSONDecodeError as exc:
+        raise ValueError(f"not a valid vtknet JSON report ({args.against}): {exc}") from exc
+    result.findings, result.stats = assertions_mod.evaluate_assertions(rules, report)
+    if not args.json:
+        for f in result.findings:
+            d = f.detail
+            mark = "PASS" if f.kind == "assert.pass" else "VIOLATED"
+            where = d.get("host") or ""
+            port = f":{d['port']}" if d.get("port") is not None else ""
+            print(f"  [{mark}] {d['expect']:<7} {d['kind']}{f' @{where}{port}' if where else ''}")
+
+
+def _run_ledger(args: argparse.Namespace, result: ScanResult) -> None:
+    if args.dry_run:
+        log.info(
+            "dry-run: would audit %s for unaccounted inbound talkers",
+            args.offline or args.iface or "default interface",
+        )
+        result.stats = {"inbound": 0, "talkers": 0}
+        return
+    if args.offline:
+        from vtknet.core.capture import iter_pcap_safe
+
+        pkts = list(iter_pcap_safe(args.offline))
+    else:
+        cfg = CaptureConfig(
+            iface=args.iface,
+            count=args.count,
+            timeout=args.duration if args.duration is not None else args.timeout,
+            max_packets=50000,
+        )
+        cap = Capture(cfg)
+        cap.start()
+        cap.wait(timeout=(cfg.timeout or 10.0) + 5.0)
+        pkts = cap.stop()
+    result.findings, result.stats = ledger_mod.ledger_unsolicited(pkts)
+    if not args.json:
+        print(f"ledger: {result.stats['inbound']} inbound packet(s), "
+              f"{result.stats['talkers']} unaccounted talker(s)")
+
+
 def _run_pcap(args: argparse.Namespace, result: ScanResult) -> None:
     summary = inspect_mod.pcap_summary(args.pcap_file)
     result.findings = [
@@ -435,6 +771,46 @@ def _run_pcap(args: argparse.Namespace, result: ScanResult) -> None:
         )
     ]
     result.stats = {"packets": summary["packets"]}
+
+
+def _resolve_run_ref(history: History, ref: str) -> int:
+    """Resolve a run reference: an integer id, or ':last' (most recent run of the
+    same command+target as the newest stored run); ':last-2' walks back further.
+
+    diff-by-default: ``vtk report --diff :last .`` answers "what changed since
+    I last looked here?" without anyone remembering run ids.
+    """
+    ref = ref.strip().lower()
+    if ref.isdigit():
+        return int(ref)
+    if not ref.startswith(":last"):
+        raise ValueError(f"unknown run reference: {ref!r} (use a run id, ':last' or ':last-N')")
+    runs = history.list_runs(1)
+    if not runs:
+        raise ValueError("history is empty — nothing to diff against")
+    newest = history.get_run(runs[0]["id"])
+    assert newest is not None  # list_runs just returned it
+    back = 1
+    if len(ref) > 5 and ref[5] == "-":
+        try:
+            back = int(ref[6:])
+        except ValueError as exc:
+            raise ValueError(f"bad run reference: {ref!r}") from exc
+    if back < 1:
+        raise ValueError(f"bad run reference: {ref!r} (':last-1' is the minimum)")
+    target = newest["args"].get("target") or newest["args"].get("name")
+    rid = history.find_last_run(newest["command"], target=target)
+    for _ in range(back - 1):  # walk back ``back`` occurrences of the same command+target
+        if rid is None:
+            break
+        rid = history.find_last_run(newest["command"], target=target, before_id=rid)
+    if rid is None:
+        raise ValueError(
+            f"no previous run of '{newest['command']}'"
+            + (f" against {target}" if target else "")
+            + " to diff against"
+        )
+    return rid
 
 
 def _run_report(args: argparse.Namespace, result: ScanResult) -> None:
@@ -454,7 +830,8 @@ def _run_report(args: argparse.Namespace, result: ScanResult) -> None:
             return
         if args.diff is not None:
             run_a, run_b = args.diff
-            d = history.diff(run_a, run_b)
+            ids = [_resolve_run_ref(history, ref) for ref in (run_a, run_b)]
+            d = history.diff(ids[0], ids[1])
             result.findings = [
                 Finding(
                     module="report",
@@ -622,6 +999,7 @@ def _run(args: argparse.Namespace) -> ScanResult:
         jitter=args.jitter,
         workers=max(1, args.workers),
         dry_run=args.dry_run,
+        emit=getattr(args, "emit", None),
     )
     engine = Engine(cfg)
     result = ScanResult(command=args.command, args=vars(args))
@@ -653,6 +1031,10 @@ def _run(args: argparse.Namespace) -> ScanResult:
             )
     elif args.command == "tls":
         _run_tls(args, engine, result)
+    elif args.command == "banner":
+        _run_banner(args, engine, result)
+    elif args.command == "kinds":
+        _run_kinds(args, result)
     elif args.command == "quic":
         _run_quic(args, engine, result)
     elif args.command == "plugins":
@@ -669,6 +1051,18 @@ def _run(args: argparse.Namespace) -> ScanResult:
         _run_mitm(args, engine, result)
     elif args.command == "inspect":
         _run_inspect(args, result)
+    elif args.command == "verify":
+        _run_verify(args, result)
+    elif args.command == "keygen":
+        _run_keygen(args, result)
+    elif args.command == "sign":
+        _run_sign(args, result)
+    elif args.command == "replay":
+        _run_replay(args, engine, result)
+    elif args.command == "assert":
+        _run_assert(args, result)
+    elif args.command == "ledger":
+        _run_ledger(args, result)
     elif args.command == "pcap":
         _run_pcap(args, result)
     elif args.command == "report":
@@ -679,6 +1073,8 @@ def _run(args: argparse.Namespace) -> ScanResult:
         _run_dhcp(args, engine, result)
     else:  # pragma: no cover — argparse enforces choices
         raise ValueError(f"unknown command: {args.command}")
+    if args.command in ("scan", "sweep", "tls", "banner") and not args.dry_run:
+        result.findings.extend(blindspot_mod.blindspots_for(result))
     result.finish(time.monotonic() - started)
     return result
 
@@ -722,11 +1118,19 @@ def main(argv: list[str] | None = None) -> int:
         except OSError as exc:
             log.error("cannot write HTML report: %s", exc)
             return EXIT_RUNTIME
+    if getattr(args, "sarif", None):
+        try:
+            report.write_sarif(result, args.sarif)
+        except OSError as exc:
+            log.error("cannot write SARIF report: %s", exc)
+            return EXIT_RUNTIME
 
     if args.json:
         print(result.to_json())
     else:
         report.print_summary(result)
+    if args.command == "assert" and result.stats.get("violated", 0) > 0:
+        return EXIT_RUNTIME  # the CI-gate contract: broken promise = non-zero
     return EXIT_OK
 
 

@@ -7,6 +7,7 @@ so every claim in a report is verifiable byte-for-byte.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from dataclasses import dataclass, field
@@ -35,16 +36,30 @@ class PortState(str, Enum):
     OPEN_FILTERED = "open|filtered"
 
 
+def sha256_hex(data: str) -> str:
+    """SHA-256 over the UTF-8 bytes of ``data`` — chain-of-custody anchor."""
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
 @dataclass
 class Evidence:
-    """A verifiable artifact backing a Finding (packet hex or pcap path)."""
+    """A verifiable artifact backing a Finding (packet hex or pcap path).
 
-    kind: str  # "packet_hex" | "pcap"
+    ``sha256`` is stamped at creation over the exact serialized ``data``
+    (hex bytes or file path) — the first link of the verify/sign chain.
+    """
+
+    kind: str  # "packet_hex" | "certificate_der" | "pcap"
     data: str  # hex bytes or file path
     note: str = ""
+    sha256: str = field(default="", compare=False)
+
+    def __post_init__(self) -> None:
+        if not self.sha256:
+            self.sha256 = sha256_hex(self.data)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"kind": self.kind, "data": self.data, "note": self.note}
+        return {"kind": self.kind, "data": self.data, "note": self.note, "sha256": self.sha256}
 
 
 @dataclass

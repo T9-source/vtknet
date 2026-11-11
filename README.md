@@ -40,7 +40,8 @@ root. `synth`, `sniff --offline`, `wifi --offline`, `inspect` and `pcap` never d
 | `sweep` | ICMP host discovery on a CIDR | yes |
 | `arp` | ARP discovery of the local segment | yes |
 | `scan` | TCP SYN/NULL/FIN/XMAS/ACK scan | yes |
-| `tls` | TLS fingerprint via `TCP_client` conversation: ServerHello version+cipher **and X.509 certificate audit** (expiry → severity, self-signed) | yes |
+| `tls` | TLS fingerprint via `TCP_client` conversation: ServerHello version+cipher **and X.509 certificate audit** (expiry → severity, self-signed); `--pq` = post-quantum hybrid probe | yes |
+| `banner` | grab the first bytes a service sends (stateful TCP conversation, evidence hex) | yes |
 | `quic` | QUIC reachability via RFC 9000 Version Negotiation (one datagram, no crypto needed) | yes |
 | `sniff` | capture live or read a pcap offline; `--out` **streams** to pcap while capturing (never OOM) | live only |
 | `synth` | seeded synthetic attack traces (6 scenarios incl. `frag_evasion`) + JSON sidecars; `--replay IFACE` replays via tcpreplay | no |
@@ -49,7 +50,15 @@ root. `synth`, `sniff --offline`, `wifi --offline`, `inspect` and `pcap` never d
 | `mitm` | ARP poisoning kit with **automatic restore**: correct bindings pushed 3× on exit, ip_forward reverted if we changed it | yes |
 | `inspect` | decode evidence hex / file / pcap bytes back into layers + the exact rebuild command | no |
 | `pcap` | streaming pcap statistics — protocols, top talkers, conversations — without loading the file | no |
-| `report` | query the run history: `--list`, `--show N`, `--diff A B` (added/removed/changed) | no |
+| `report` | query the run history: `--list`, `--show N`, `--diff A B` (added/removed/changed; `:last` = newest run of the same command+target) | no |
+| `kinds` | the finding-kind registry: meanings + default severities; `--schema` emits the JSON Schema | no |
+| `verify` | re-derive every evidence SHA-256 in a saved report — tamper-evident chain of custody (`verify.tampered` on mismatch) | no |
+| `keygen` | generate an Ed25519 signing keypair (`~/.vtknet/keys/`) | no |
+| `sign` | DSSE-sign a saved report (`report.json.dsse`) — standards-grade tamper evidence | no |
+| `replay` | re-send the exact evidence bytes of one finding (evidence is executable) | yes |
+| `assert` | desired-state assertions over a report — exit 1 on any broken promise | no |
+| `ledger` | double-entry wire audit: unaccounted inbound talkers become findings | live only / `--offline` |
+| `verify --prove ID` | Merkle inclusion proof — share one finding without the rest of the report | no |
 | `dns` | same query to N resolvers — divergent answers = suspected spoofing (HIGH) | yes |
 | `dhcp` | broadcast discover, classify every offer — rogue-server detection (`--known-server`) | yes |
 | `plugins` | list discovered plugins (see below) | no |
@@ -65,6 +74,7 @@ sudo vtk scan 10.0.0.5 --ports 1-1024 --type syn      # auto-saved
 vtk report --list                                      # recent runs
 vtk report --show 3                                    # full JSON of run #3
 vtk report --diff 2 3                                  # added/removed/changed
+vtk report --diff 4 :last                              # ':last' = newest run of the same command+target
 ```
 
 Diffing keys findings by identity (`module|kind|host|port`) and ignores
@@ -138,6 +148,16 @@ sudo vtk scan 10.0.0.5 --ports 1-1024 --type syn --rate 200 --json --report out.
 # TLS: version, cipher AND certificate health in one probe
 sudo vtk tls example.com --sni example.com
 
+# post-quantum compatibility: ClientHello offering X25519MLKEM768
+# (add --force-fragment to pad it past the MTU — fragmented-CH test)
+sudo vtk tls example.com --pq
+
+# what does the service say first? (banner + evidence bytes)
+sudo vtk banner 192.168.1.50 --port 22
+
+# rehearse a sweep without sending anything, then review the exact bytes
+vtk sweep 192.168.1.0/24 --dry-run --emit plan.pcap
+
 # fuzz a lab device: same seed reproduces the crashing packet byte-for-byte
 sudo vtk fuzz 192.168.1.50 --base tcp --port 8080 --count 200 --seed 1337
 
@@ -156,6 +176,19 @@ sudo vtk synth --scenario syn_flood --pcap floods.pcap --count 200 --replay eth0
 # read the evidence back — bytes to layers, both directions
 vtk inspect --hex 4545000c000100004011f96bc0a800016322e34900350035
 vtk pcap frags.pcap
+
+# prove the report wasn't touched: sign it, then re-derive signature + every evidence hash
+vtk keygen && vtk sign out.json
+vtk verify out.json.dsse
+
+# prove ONE finding to a third party without the rest of the report
+vtk verify out.json --prove <finding-id>
+
+# the network as desired-state: broken promise = exit 1 (CI gate)
+vtk assert rules.json --against out.json
+
+# who talked to us unasked?
+vtk ledger --offline suspicious.pcap
 ```
 
 Common flags (after the subcommand): `--json`, `--report FILE`, `--html FILE`,
@@ -174,7 +207,8 @@ Global: `--plugin-dir DIR` (before the subcommand).
       "module": "tlsprobe", "kind": "tls.serverhello", "host": "203.0.113.9", "port": 443,
       "state": "open", "severity": "info",
       "detail": {"version_int": "0x0303", "cipher": 49199},
-      "evidence": [{"kind": "packet_hex", "data": "1603032c02...", "note": "server TLS record"}]
+      "evidence": [{"kind": "packet_hex", "data": "1603032c02...", "note": "server TLS record",
+                    "sha256": "9a1f..."}]
     },
     {
       "module": "tlsprobe", "kind": "tls.cert.expired", "severity": "high",

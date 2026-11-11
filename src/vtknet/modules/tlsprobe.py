@@ -16,10 +16,14 @@ from typing import Any
 
 from scapy.all import Raw
 
+from vtknet.core.converse import link_recv_bounded
 from vtknet.core.engine import Engine
 from vtknet.core.models import Evidence, Finding, Severity
 
 log = logging.getLogger("vtknet.tlsprobe")
+
+# shared by both the plain and the PQ probe: userspace TCP conversations
+
 
 try:  # scapy TLS layers need ``cryptography`` at import time in some setups
     from scapy.layers.tls.handshake import TLSServerHello
@@ -35,6 +39,191 @@ DEFAULT_CIPHERS = [
     0xC02F,  # ECDHE-RSA-AES128-GCM-SHA256
     0x002F,  # RSA-AES128-SHA
 ]
+
+
+# -- post-quantum hybrid ClientHello --------------------------------------
+#
+# Real clients increasingly offer X25519MLKEM768; the hybrid key_share pushes
+# the ClientHello from ~300 to ~1400 bytes — past typical MTUs — and PKIC's
+# multi-million-server scans documented origins that fail on *fragmented*
+# ClientHellos (plus real breakage in middleboxes during 2026). The probe
+# emits both shapes: a PQ-advertising hello, and a padded (forced-fragment)
+# hello, then reads back which key_share group the server actually SELECTED.
+
+# X25519MLKEM768 IANA "TLS Supported Groups" code point: 4588 DECIMAL.
+# (4588 == 0x11EC — writing it as 0x4588 would advertise an unassigned
+# group and make every server look post-quantum.)
+MLKEM768_GROUP = 0x11EC
+PQ_CIPHERS = [
+    0x1302,  # TLS_AES_256_GCM_SHA384
+    0x1301,  # TLS_AES_128_GCM_SHA256
+    0xC02F,  # ECDHE-RSA-AES128-GCM-SHA256
+]
+
+
+def build_pq_client_hello_bytes(
+    sni: str | None = None,
+    ciphers: list[int] | None = None,
+    rng: random.Random | None = None,
+    force_fragment: bool = False,
+) -> bytes:
+    """ClientHello advertising the PQ-hybrid group (deterministic, v1 probe).
+
+    ``force_fragment=True`` pads the hello (RFC 7685 padding extension) past
+    1500 bytes so it crosses the TCP segment boundary exactly like real
+    post-quantum ClientHellos do — the shape middleboxes choke on.
+    """
+    rng = rng or random.Random(0x5CA9)
+    ciphers = ciphers if ciphers is not None else PQ_CIPHERS
+    body = b"\x01\x00\x00\x00"
+    body += b"\x03\x03"
+    body += rng.getrandbits(256).to_bytes(32, "big")
+    body += b"\x20" + rng.getrandbits(256).to_bytes(32, "big")
+    suites = b"".join(c.to_bytes(2, "big") for c in ciphers)
+    body += len(suites).to_bytes(2, "big") + suites
+    body += b"\x01\x00"
+    exts = b""
+    if sni:
+        host = sni.encode("idna") if sni.encode("idna") else sni.encode("ascii")
+        exts += _sni_extension(host)
+    exts += b"\x00\x2b\x00\x03\x02\x03\x04"  # supported_versions: TLS 1.3
+    # supported_groups: X25519MLKEM768 FIRST (client preference — real clients
+    # list the hybrid group ahead of x25519), then classical x25519
+    exts += b"\x00\x0a\x00\x08\x00\x06" + MLKEM768_GROUP.to_bytes(2, "big") + b"\x00\x1d"
+    # key_share (0x0033): ONE 1216-byte X25519MLKEM768 client share —
+    # ML-KEM-768 encapsulation key (1184B) FIRST, then the 32-byte x25519
+    # share (reversed order "due to historical reasons", RFC 10024 §3.2).
+    # This is the exact wire shape Chrome puts out; no separate x25519 entry.
+    x25519_pub = rng.getrandbits(256).to_bytes(32, "big")
+    mlkem_ek = rng.getrandbits(9472).to_bytes(1184, "big")
+    hybrid_share = mlkem_ek + x25519_pub
+    entry = MLKEM768_GROUP.to_bytes(2, "big") + len(hybrid_share).to_bytes(2, "big") + hybrid_share
+    exts += b"\x00\x33" + len(entry).to_bytes(2, "big") + entry
+    exts += b"\x00\x0d\x00\x06\x00\x04\x04\x03\x08\x04"  # signature_algorithms
+    if force_fragment:
+        pad_len = max(0, 1600 - (len(body) + len(exts) + 4 + 5))
+        exts += b"\x00\x15" + pad_len.to_bytes(2, "big") + b"\x00" * pad_len
+    body += len(exts).to_bytes(2, "big") + exts
+    body = body[:1] + (len(body) - 4).to_bytes(3, "big") + body[4:]
+    return b"\x16\x03\x01" + len(body).to_bytes(2, "big") + body
+
+
+def pq_tls_probe(
+    engine: Engine,
+    dst: str,
+    port: int = 443,
+    sni: str | None = None,
+    force_fragment: bool = False,
+    link_factory: Callable[[str, int], Any] | None = None,
+) -> tuple[list[Finding], dict[str, int]]:
+    """Send one PQ-hybrid ClientHello and classify the reply.
+
+    The ClientHello offers x25519 + X25519MLKEM768 (IANA code point 4588 =
+    0x11EC) with a deterministic dummy key_share. On a ServerHello reply the
+    server's SELECTED key_share group is read back from the record:
+
+    - ``tls.pq.negotiated`` — server selected 0x11EC: a genuine
+      post-quantum key-exchange path (info)
+    - ``tls.pq.fallback`` — ServerHello came but a classical group was
+      selected: the PQ hello survived the path, the server chose x25519
+      (info)
+    - ``tls.pq.alert`` — explicit rejection (low)
+    - ``tls.pq.other`` / ``tls.pq.no-response`` — as before
+
+    Limit, documented honestly: the client key_share carries deterministic
+    dummy material, so no hybrid handshake can complete — group-selection
+    and ServerHello/alert detection are valid; cipher agreement is not.
+    Link reads are bounded by ``engine.cfg.timeout`` so silent-open servers
+    cannot hang the probe.
+    """
+    if engine.cfg.dry_run:
+        hello = build_pq_client_hello_bytes(sni=sni, force_fragment=force_fragment)
+        log.info(
+            "dry-run: would send a %d-byte PQ ClientHello to %s:%d (fragment_forced=%s)",
+            len(hello),
+            dst,
+            port,
+            force_fragment,
+        )
+        return [], {"sent": 0}
+
+    factory = link_factory or _default_link_factory
+    hello = build_pq_client_hello_bytes(sni=sni, force_fragment=force_fragment)
+    payloads: list[bytes] = []
+    primary: dict[str, Any] | None = None
+    try:
+        link = factory(dst, port)
+    except Exception as exc:  # noqa: BLE001 — connect failures come in many shapes
+        log.warning("could not open conversation to %s:%d: %s", dst, port, exc)
+        return [_finding(dst, "tls.pq.no-response", port, sni, state="filtered")], {"sent": 0}
+    try:
+        link.send(hello)
+        for _ in range(3):
+            data = link_recv_bounded(link, engine.cfg.timeout)
+            if not data:
+                break  # timeout (link already closed by the bounded read) or EOF
+            payloads.append(data)
+            info = parse_server_hello(data)
+            if info["kind"] in ("tls.serverhello", "tls.alert"):
+                primary = info
+                break
+    finally:
+        try:
+            link.close()
+        except Exception as exc:  # noqa: BLE001 — closing an already-dead socket is not fatal
+            log.debug("link close: %s", exc)
+
+    if primary is None:
+        kind = "tls.pq.no-response" if not payloads else "tls.pq.other"
+        findings = [_finding(dst, kind, port, sni, state=None if payloads else "filtered")]
+        if payloads:
+            findings[0].detail["note"] = "reply was not a ServerHello/alert"
+            findings[0].evidence = [Evidence("packet_hex", payloads[0].hex(), "first reply bytes")]
+    elif primary["kind"] == "tls.alert":
+        findings = [
+            Finding(
+                module="tlsprobe",
+                kind="tls.pq.alert",
+                host=dst,
+                port=port,
+                state="open",
+                severity=Severity.LOW,
+                detail={
+                    "port": port,
+                    "sni": sni or dst,
+                    "hello_bytes": len(hello),
+                    "force_fragment": force_fragment,
+                    **primary,
+                },
+                evidence=[Evidence("packet_hex", payloads[0].hex(), "server TLS record (PQ probe)")],
+            )
+        ]
+    else:
+        selected = parse_serverhello_selected_group(payloads[-1])
+        confirmed = selected == MLKEM768_GROUP
+        findings = [
+            Finding(
+                module="tlsprobe",
+                kind="tls.pq.negotiated" if confirmed else "tls.pq.fallback",
+                host=dst,
+                port=port,
+                state="open",
+                severity=Severity.INFO,
+                detail={
+                    "port": port,
+                    "sni": sni or dst,
+                    "hello_bytes": len(hello),
+                    "force_fragment": force_fragment,
+                    "pq_selected_group": f"0x{selected:04x}" if selected is not None else None,
+                    "pq_confirmed": confirmed,
+                    **primary,
+                },
+                evidence=[Evidence("packet_hex", payloads[0].hex(), "server TLS record (PQ probe)")],
+            )
+        ]
+    stats = {"sent": 1, "chunks": len(payloads)}
+    log.info("pq-tls probe %s:%d -> %s", dst, port, findings[0].kind)
+    return findings, stats
 
 
 # -- building (pure, deterministic) ------------------------------------
@@ -95,6 +284,47 @@ def parse_server_hello(record_bytes: bytes) -> dict[str, Any]:
     if parsed.haslayer(TLSAlert):
         return {"kind": "tls.alert", "description": int(parsed[TLSAlert].descr)}
     return {"kind": "tls.other"}
+
+
+def parse_serverhello_selected_group(record_bytes: bytes) -> int | None:
+    """Extract the key_share group the server SELECTED from a ServerHello.
+
+    Pure bytes walk (no scapy TLS dependency). TLS 1.3 ServerHello framing:
+    record(type 0x16) + handshake(type 0x02) + legacy_version(2) +
+    random(32) + legacy_session_id<0..32> + cipher(2) + compression(1) +
+    extensions; the key_share extension (0x0033) in a ServerHello holds
+    exactly one entry: ``selected_group(2) + key_len(2) + key``. Returns
+    ``None`` for alerts, TLS 1.2 hellos, or anything malformed — hostile
+    bytes can only yield None, never an exception.
+    """
+    try:
+        if len(record_bytes) < 43 or record_bytes[0] != 0x16:  # not a handshake record
+            return None
+        rec_len = int.from_bytes(record_bytes[3:5], "big")
+        p = 5
+        end = min(5 + rec_len, len(record_bytes))
+        if p >= end or record_bytes[p] != 0x02:  # not a ServerHello
+            return None
+        p += 4  # handshake type + 3-byte length
+        p += 2 + 32  # legacy_version + random
+        sid_len = record_bytes[p]
+        p += 1 + sid_len
+        p += 2  # cipher_suite
+        p += 1  # legacy_compression_method
+        if p + 2 > end:
+            return None
+        ext_total = int.from_bytes(record_bytes[p : p + 2], "big")
+        p += 2
+        ext_end = min(p + ext_total, end)
+        while p + 4 <= ext_end:
+            etype = int.from_bytes(record_bytes[p : p + 2], "big")
+            elen = int.from_bytes(record_bytes[p + 2 : p + 4], "big")
+            if etype == 0x0033 and p + 6 <= ext_end:
+                return int.from_bytes(record_bytes[p + 4 : p + 6], "big")
+            p += 4 + elen
+    except (IndexError, ValueError):
+        return None
+    return None
 
 
 # -- certificate extraction (hand-parsed framing, cryptography for X.509) ---
@@ -200,13 +430,25 @@ def tls_probe(
     port: int = 443,
     sni: str | None = None,
     link_factory: Callable[[str, int], Any] | None = None,
+    pq: bool = False,
+    force_fragment: bool = False,
 ) -> tuple[list[Finding], dict[str, int]]:
     """Open a TCP conversation to dst:port, send a ClientHello, classify the reply.
 
     The handshake runs over scapy's ``TCP_client`` automaton — SYN, ACKs and
     retransmissions handled by the supersocket instead of hand-tracked
     seq/ack. Pass ``link_factory`` to inject a fake supersocket (tests).
+    With ``pq=True`` this becomes the post-quantum hybrid probe (v1).
     """
+    if pq:
+        return pq_tls_probe(
+            engine,
+            dst,
+            port=port,
+            sni=sni,
+            force_fragment=force_fragment,
+            link_factory=link_factory,
+        )
     if engine.cfg.dry_run:
         hello = build_client_hello_bytes(sni=sni)
         log.info(

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]  # PEP 639 license-files support
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,9 +8,15 @@ version = "0.7.0"
 description = "Evidence-driven network testing toolkit built on Scapy: packet-in/packet-out pipeline, structured JSON findings with raw-packet proof."
 readme = "README.md"
 requires-python = ">=3.9"
-keywords = ["scapy", "network", "security", "scanning", "packet-crafting"]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = ["scapy", "network", "security", "scanning", "packet-crafting", "detection-engineering", "evidence"]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Telecommunications Industry",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Security",
     "Topic :: System :: Networking",
 ]
