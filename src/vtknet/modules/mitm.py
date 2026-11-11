@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 
 from scapy.all import ARP, Ether, conf, get_if_hwaddr
 from scapy.packet import Packet
@@ -59,8 +60,7 @@ def _read_forward(path: str) -> int | None:
 
 def _write_forward(path: str, value: int) -> bool:
     try:
-        with open(path, "w") as fh:
-            fh.write(str(value))
+        Path(path).write_text(str(value))
         return True
     except OSError:
         return False

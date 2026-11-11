@@ -13,6 +13,7 @@ import logging
 import random
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 from scapy.all import ARP, DNS, DNSQR, IP, TCP, UDP, Ether, Raw, rdpcap, wrpcap
@@ -191,11 +192,18 @@ def build_trace(
 def write_trace(name: str, path: str, **kwargs: Any) -> TraceMeta:
     """Build the trace, write the pcap and a JSON metadata sidecar (<path>.json)."""
     pkts, meta = build_trace(name, **kwargs)
-    wrpcap(path, pkts)
-    sidecar = f"{path}.json"
-    with open(sidecar, "w", encoding="utf-8") as fh:
-        json.dump({"tool": "vtknet", "version": vtknet.__version__, **asdict(meta)}, fh, indent=2)
-    log.info("trace %s: %d packets -> %s (meta: %s)", name, meta.count, path, sidecar)
+    out = Path(path).expanduser()
+    if not out.parent.is_dir():
+        # fail before touching the network-facing parts: a clean CLI error
+        # beats scapy's traceback when the operator typos the output path
+        raise FileNotFoundError(f"output directory does not exist: {out.parent}")
+    wrpcap(str(out), pkts)
+    sidecar = out.with_name(out.name + ".json")
+    sidecar.write_text(
+        json.dumps({"tool": "vtknet", "version": vtknet.__version__, **asdict(meta)}, indent=2),
+        encoding="utf-8",
+    )
+    log.info("trace %s: %d packets -> %s (meta: %s)", name, meta.count, out, sidecar)
     return meta
 
 

@@ -13,6 +13,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 
@@ -110,7 +111,10 @@ class ScanResult:
         self.duration_s = round(duration_s, 3)
 
     def to_dict(self) -> dict[str, Any]:
+        from vtknet.core.kinds import SCHEMA_VERSION  # local: avoids an import cycle
+
         return {
+            "schema_version": SCHEMA_VERSION,
             "command": self.command,
             "args": self.args,
             "started": self.started,
@@ -124,5 +128,4 @@ class ScanResult:
         return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
 
     def save(self, path: str) -> None:
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(self.to_json())
+        Path(path).write_text(self.to_json(), encoding="utf-8")

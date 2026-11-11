@@ -1,6 +1,6 @@
-import os
 import tempfile
 import unittest
+from pathlib import Path
 
 from vtknet.core.plugins import VtkPlugin, discover, load_file_plugins
 
@@ -39,29 +39,23 @@ class Ping(VtkPlugin):
 class DiscoveryTest(unittest.TestCase):
     def test_load_file_plugins_from_dir(self):
         with tempfile.TemporaryDirectory() as d:
-            with open(os.path.join(d, "hello_ports.py"), "w") as fh:
-                fh.write(GOOD_PLUGIN)
-            with open(os.path.join(d, "ping.py"), "w") as fh:
-                fh.write(SECOND_PLUGIN)
-            with open(os.path.join(d, "not_python.txt"), "w") as fh:
-                fh.write("ignored")
+            Path(d, "hello_ports.py").write_text(GOOD_PLUGIN)
+            Path(d, "ping.py").write_text(SECOND_PLUGIN)
+            Path(d, "not_python.txt").write_text("ignored")
             found = load_file_plugins(d)
             names = {p.name for p in found}
             self.assertEqual(names, {"hello-ports", "ping"})
 
     def test_broken_plugin_file_does_not_kill_loader(self):
         with tempfile.TemporaryDirectory() as d:
-            with open(os.path.join(d, "bad.py"), "w") as fh:
-                fh.write("raise RuntimeError('boom')\n")
-            with open(os.path.join(d, "good.py"), "w") as fh:
-                fh.write(GOOD_PLUGIN)
+            Path(d, "bad.py").write_text("raise RuntimeError('boom')\n")
+            Path(d, "good.py").write_text(GOOD_PLUGIN)
             names = {p.name for p in load_file_plugins(d)}
             self.assertEqual(names, {"hello-ports"})
 
     def test_plugin_without_name_is_dropped_at_discovery(self):
         with tempfile.TemporaryDirectory() as d:
-            with open(os.path.join(d, "no_name.py"), "w") as fh:
-                fh.write("from vtknet.plugins import VtkPlugin\nclass A(VtkPlugin): pass\n")
+            Path(d, "no_name.py").write_text("from vtknet.plugins import VtkPlugin\nclass A(VtkPlugin): pass\n")
             self.assertEqual(len(load_file_plugins(d)), 1)  # raw loader returns it…
             self.assertEqual(discover([d]), [])  # …discover() filters it out
 
@@ -70,8 +64,7 @@ class DiscoveryTest(unittest.TestCase):
 
     def test_discover_dedupes_by_name(self):
         with tempfile.TemporaryDirectory() as d:
-            with open(os.path.join(d, "hello_ports.py"), "w") as fh:
-                fh.write(GOOD_PLUGIN)
+            Path(d, "hello_ports.py").write_text(GOOD_PLUGIN)
             found = discover([d, d])  # same dir twice
             self.assertEqual(len(found), 1)
             self.assertEqual(found[0].name, "hello-ports")

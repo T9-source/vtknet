@@ -3,6 +3,7 @@ import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 
 from scapy.all import ARP, Ether
 
@@ -61,8 +62,7 @@ class LifecycleTest(unittest.TestCase):
         eng = SpoofEngine()
         with tempfile.TemporaryDirectory() as d:
             fwd = os.path.join(d, "ip_forward")
-            with open(fwd, "w") as fh:
-                fh.write("0\n")
+            Path(fwd).write_text("0\n")
             spoof = ArpSpoofer(
                 eng, VICTIM_IP, GATEWAY_IP, interval=0.01, forward_path=fwd
             )

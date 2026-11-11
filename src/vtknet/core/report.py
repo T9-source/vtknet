@@ -6,6 +6,7 @@ import html
 import json
 import logging
 import uuid
+from pathlib import Path
 
 import vtknet
 from vtknet.core.kinds import get_kind
@@ -221,12 +222,10 @@ def render_sarif(result: ScanResult) -> str:
 
 
 def write_sarif(result: ScanResult, path: str) -> None:
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(render_sarif(result))
+    Path(path).write_text(render_sarif(result), encoding="utf-8")
     log.info("SARIF report written to %s", path)
 
 
 def write_html(result: ScanResult, path: str) -> None:
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(render_html(result))
-        log.info("HTML report written to %s", path)
+    Path(path).write_text(render_html(result), encoding="utf-8")
+    log.info("HTML report written to %s", path)

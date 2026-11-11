@@ -4,11 +4,19 @@ Every module labels its claims with a ``kind``; this registry is the single
 place that defines what each label means and its default severity. It backs
 ``vtk kinds`` (human table), ``vtk kinds --schema`` (JSON Schema for the
 findings payload) and keeps module/plugin labels from drifting apart.
+
+Taxonomy contract (OSV-style, per https://ossf.github.io/osv-schema/):
+- ``SCHEMA_VERSION`` follows SemVer; MINOR/PATCH bumps are additive-only —
+  new kinds or new optional fields never change the meaning of old ones;
+- consumers that know 1.2.0 can safely read 1.3.0 by ignoring unknown kinds;
+- removing or re-meaning a kind requires a MAJOR bump (never done so far).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+SCHEMA_VERSION = "1.1.0"  # SemVer; additive-only evolution (see module docstring)
 
 
 @dataclass(frozen=True)
@@ -269,7 +277,12 @@ def get_kind(kind: str) -> KindSpec | None:
 
 
 def kinds_schema() -> dict:
-    """JSON Schema (draft-07) for the findings payload, kinds as a closed enum."""
+    """JSON Schema (draft-07) for the findings payload, kinds as a closed enum.
+
+    draft-07 is a deliberate compatibility choice (SARIF 2.1.0 and Semgrep
+    both declare draft-07); the payload additionally carries
+    ``schema_version`` so OSV-style additive evolution stays auditable.
+    """
     kind_enum = {
         "oneOf": [
             {"const": k, "description": f"{s.meaning} (default severity: {s.severity})"}
@@ -280,8 +293,9 @@ def kinds_schema() -> dict:
         "$schema": "http://json-schema.org/draft-07/schema#",
         "title": "vtknet findings",
         "type": "object",
-        "required": ["command", "findings"],
+        "required": ["schema_version", "command", "findings"],
         "properties": {
+            "schema_version": {"const": SCHEMA_VERSION, "description": "SemVer; additive-only evolution"},
             "command": {"type": "string"},
             "args": {"type": "object"},
             "started": {"type": "string"},
@@ -330,3 +344,21 @@ def render_kinds_text() -> str:
         s = KINDS[k]
         lines.append(f"{s.kind:<28} {s.module:<10} {s.severity:<7} {s.meaning}")
     return "\n".join(lines)
+
+
+# -- sprint 2/3/5 kinds (registered here so the registry stays the single source) --
+
+for _kind, _meaning, _sev in (
+    ("eval.detected", "IDS alert matched the scenario's ground-truth signal", "info"),
+    ("eval.missed", "IDS produced no alert matching the expected signal — detection gap", "high"),
+    ("watch.added", "Watch round: a finding appeared that was absent last round", "low"),
+    ("watch.removed", "Watch round: a finding from last round is gone", "low"),
+    ("watch.changed", "Watch round: a known finding changed state/detail", "medium"),
+    ("notarize.manifest", "Notarization manifest: Merkle root over the report's evidence", "info"),
+    ("notarize.rekor-entry", "Hash recorded in the Rekor transparency log (public timestamp)", "info"),
+    ("fuzz.minimized", "Crashing mutant minimized to its field-minimal form", "info"),
+    ("verify.deep.holds", "Deep verify: the evidence bytes still support the claim", "info"),
+    ("verify.deep.contradicts", "Deep verify: the evidence bytes contradict the claim", "medium"),
+    ("verify.deep.skipped", "Deep verify: evidence not deep-checkable (recorded, not failed)", "info"),
+):
+    register_kind(KindSpec(_kind, _kind.split(".")[0], _meaning, _sev))

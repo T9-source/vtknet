@@ -1,0 +1,42 @@
+# vtknet — GitHub Action (PR gate: desired-state assertions over a scan report)
+#
+# Usage in a repo that keeps a vtknet assertion file:
+#
+#   - uses: vtknet/vtknet@v1
+#     with:
+#       report: lab-report.json        # produced by an earlier step (vtk ... --report)
+#       rules:  assert.json            # {"title": "...", "assertions": [...]}
+#
+# The action runs `vtk assert rules --against report` and fails the check
+# on any violation (exit 1) — the desired-state CI gate.
+
+name: 'vtknet assert gate'
+description: 'Run vtknet desired-state assertions against a scan report (exit 1 on violation)'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  report:
+    description: 'Path to the vtknet JSON report to evaluate'
+    required: true
+  rules:
+    description: 'Path to the assertions JSON file'
+    required: true
+  vtknet-version:
+    description: 'vtknet version to install (default: latest from PyPI)'
+    required: false
+    default: 'latest'
+
+runs:
+  using: 'composite'
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        if [ "${{ inputs.vtknet-version }}" = "latest" ]; then
+          pip install vtknet
+        else
+          pip install "vtknet==${{ inputs.vtknet-version }}"
+        fi
+        vtk assert "${{ inputs.rules }}" --against "${{ inputs.report }}"

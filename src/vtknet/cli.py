@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -14,21 +16,25 @@ from vtknet.core import assertions as assertions_mod
 from vtknet.core import blindspot as blindspot_mod
 from vtknet.core import inspect as inspect_mod
 from vtknet.core import ledger as ledger_mod
+from vtknet.core import notarize as notarize_mod
 from vtknet.core import plugins as plugins_mod
 from vtknet.core import replay as replay_mod
-from vtknet.core import report
+from vtknet.core import report, verifydeep
 from vtknet.core import signing as signing_mod
 from vtknet.core import verify as verify_mod
+from vtknet.core import watch as watch_mod
 from vtknet.core.capture import Capture, CaptureConfig
 from vtknet.core.engine import Engine, EngineConfig
 from vtknet.core.kinds import kinds_schema, render_kinds_text
-from vtknet.core.models import Finding, ScanResult, Severity
+from vtknet.core.models import Evidence, Finding, ScanResult, Severity
 from vtknet.core.store import DEFAULT_DB, History
 from vtknet.modules import (
     banner,
     dhcpprobe,
     dnsprobe,
+    echprobe,
     fuzz,
+    idseval,
     mitm,
     quicprobe,
     recon,
@@ -61,6 +67,8 @@ AUTO_SAVE_COMMANDS = {
     "dhcp",
     "ledger",
     "banner",
+    "ech",
+    "eval",
 }
 
 BUILTIN_COMMANDS = {
@@ -87,6 +95,10 @@ BUILTIN_COMMANDS = {
     "replay",
     "assert",
     "ledger",
+    "ech",
+    "eval",
+    "watch",
+    "notarize",
     "plugins",
 }
 
@@ -268,6 +280,11 @@ def build_parser(plugin_dirs: list[str] | None = None) -> argparse.ArgumentParse
         default=None,
         help="emit a Merkle inclusion proof for one finding — share a single result without the rest",
     )
+    p_verify.add_argument(
+        "--deep",
+        action="store_true",
+        help="also re-derive claims from evidence bytes (flags/ICMP/certificate), not just hashes",
+    )
 
     p_keygen = sub.add_parser(
         "keygen", parents=[common], help="generate an Ed25519 signing keypair for report signing"
@@ -285,6 +302,14 @@ def build_parser(plugin_dirs: list[str] | None = None) -> argparse.ArgumentParse
         metavar="KEY",
         default=None,
         help="Ed25519 private key (.key) (default: newest in ~/.vtknet/keys)",
+    )
+    p_sign.add_argument(
+        "--intoto",
+        action="store_true",
+        help="sign as an in-toto Statement v1 (cosign-compatible attestation shape)",
+    )
+    p_sign.add_argument(
+        "--out", metavar="FILE", default=None, help="envelope path (default: <report>.dsse / .intoto.dsse)"
     )
 
     p_replay = sub.add_parser(
@@ -317,6 +342,49 @@ def build_parser(plugin_dirs: list[str] | None = None) -> argparse.ArgumentParse
     p_ledger.add_argument("--duration", type=float, default=None, help="live capture seconds (default: --timeout)")
     p_ledger.add_argument("--count", type=int, default=0, help="stop after N packets (live, 0 = unlimited)")
 
+    p_ech = sub.add_parser(
+        "ech",
+        parents=[common],
+        help="Encrypted Client Hello surface (RFC 9849): DNS configs + GREASE probe",
+    )
+    p_ech.add_argument("target", help="hostname to probe (single host)")
+    p_ech.add_argument("--port", type=int, default=443, help="TLS port (default 443)")
+    p_ech.add_argument("--sni", default=None, help="SNI hostname (default: the target)")
+
+    p_eval = sub.add_parser(
+        "eval",
+        parents=[common],
+        help="synth --eval: generate a scenario, run an IDS over it, score detection (Sprint 2)",
+    )
+    p_eval.add_argument("scenario", help="synth scenario name (see vtk synth --list)")
+    p_eval.add_argument("--engine", default="suricata", choices=["suricata", "null"], help="IDS engine")
+    p_eval.add_argument("--seed", type=int, default=1337, help="trace seed (same seed = same attack)")
+    p_eval.add_argument("--count", type=int, default=50, help="packets per trace")
+    p_eval.add_argument("--target", default="192.0.2.9", help="attack target inside the trace")
+    p_eval.add_argument("--workdir", metavar="DIR", default=None, help="artifacts dir (default: temp)")
+
+    p_watch = sub.add_parser(
+        "watch",
+        parents=[common],
+        help="scheduled probe rounds + diff alerts (network-truth daemon, MVP)",
+    )
+    p_watch.add_argument("--profile", metavar="JSON", default=None, help="profile file (default: built-in)")
+    p_watch.add_argument("--once", action="store_true", help="run one round and exit")
+    p_watch.add_argument("--print-profile", action="store_true", help="print the built-in profile and exit")
+
+    p_notarize = sub.add_parser(
+        "notarize",
+        parents=[common],
+        help="record the report's evidence Merkle root in the Rekor transparency log (hash-only)",
+    )
+    p_notarize.add_argument("report_file", help="saved JSON report (plain or .dsse)")
+    p_notarize.add_argument(
+        "--online", action="store_true", help="actually submit to rekor.sigstore.dev (default: offline manifest)"
+    )
+    p_notarize.add_argument(
+        "--key", metavar="PUB", default=None, help="public key for .dsse reports (default: newest)"
+    )
+
     p_dns = sub.add_parser(
         "dns", parents=[common], help="ask several resolvers the same question — divergence = suspected spoofing"
     )
@@ -339,6 +407,11 @@ def build_parser(plugin_dirs: list[str] | None = None) -> argparse.ArgumentParse
     p_fuzz.add_argument("--base", default="tcp", choices=fuzz.BASES, help="base packet to mutate")
     p_fuzz.add_argument("--port", type=int, default=None, help="destination port for tcp/udp bases")
     p_fuzz.add_argument("--seed", type=int, default=1337, help="RNG seed (same seed = same mutants)")
+    p_fuzz.add_argument(
+        "--minimize",
+        action="store_true",
+        help="on crash: delta-debug the crashing mutant down to its minimal form (live re-fires)",
+    )
 
     p_wifi = sub.add_parser(
         "wifi",
@@ -379,11 +452,14 @@ def build_parser(plugin_dirs: list[str] | None = None) -> argparse.ArgumentParse
 def _needs_raw_sockets(args: argparse.Namespace) -> bool:
     """Commands that touch raw sockets (offline modes and synth need no privileges)."""
     if args.command in (
-        "inspect", "pcap", "plugins", "report", "kinds", "verify", "keygen", "sign", "assert"
+        "inspect", "pcap", "plugins", "report", "kinds", "verify", "keygen", "sign", "assert",
+        "notarize", "eval",
     ):
         return False
     if args.command == "ledger":
         return getattr(args, "offline", None) is None  # offline audit needs no privileges
+    if args.command == "watch" and getattr(args, "print_profile", False):
+        return False  # printing the built-in profile sends nothing
     if args.command == "synth":
         return bool(getattr(args, "replay", None))  # tcpreplay sends on a real iface
     if args.command in ("sniff", "wifi"):
@@ -613,8 +689,15 @@ def _run_verify(args: argparse.Namespace, result: ScanResult) -> None:
     extra: list[Finding] = []
     if signing_mod.is_envelope(parsed):
         key = args.key or _newest_key(signing_mod.DEFAULT_KEYS_DIR, "*.pub")
-        body = signing_mod.verify_envelope(parsed, key)  # fail closed -> ValueError
-        report = json.loads(body)
+        if parsed.get("payloadType") == "application/vnd.in-toto+json":
+            # in-toto Statement envelope: verify through the intoto verifier
+            from vtknet.core import intoto as intoto_mod
+
+            statement = intoto_mod.verify_statement_envelope(parsed, key)  # fail closed
+            report = statement.get("predicate", statement)
+        else:
+            body = signing_mod.verify_envelope(parsed, key)  # fail closed -> ValueError
+            report = json.loads(body)
         extra = [
             Finding(
                 module="sign",
@@ -642,15 +725,25 @@ def _run_verify(args: argparse.Namespace, result: ScanResult) -> None:
             print(json.dumps(proof, indent=2))
         return
 
-    findings, stats = verify_mod.verify_report(report)
+    deep = bool(getattr(args, "deep", False))
+    if deep:
+        findings, stats = verifydeep.verify_report_deep(report)
+    else:
+        findings, stats = verify_mod.verify_report(report)
     result.findings = extra + findings
     result.stats = stats
     if not args.json:
         s = findings[0].detail
         sig = "signed+verified " if extra else ""
+        deep_txt = (
+            f" deep: holds={stats.get('deep_holds', 0)} "
+            f"contradicts={stats.get('deep_contradicts', 0)} skipped={stats.get('deep_skipped', 0)} —"
+            if deep
+            else "—"
+        )
         print(
-            f"verify {args.report_file}: {sig}{s['evidences']} evidence(s) — "
-            f"hash-ok={s['hashed_ok']} tampered={s['tampered']} "
+            f"verify {args.report_file}: {sig}{s['evidences']} evidence(s) "
+            f"{deep_txt} hash-ok={s['hashed_ok']} tampered={s['tampered']} "
             f"unhashed={s['no_hash']} unknown-kinds={s['unknown_kind']}"
         )
 
@@ -682,8 +775,31 @@ def _run_sign(args: argparse.Namespace, result: ScanResult) -> None:
     except json.JSONDecodeError as exc:
         raise ValueError(f"not a valid vtknet JSON report ({path}): {exc}") from exc
     key = args.key or _newest_key(signing_mod.DEFAULT_KEYS_DIR, "*.key")
-    envelope = signing_mod.sign_report(report, key)
-    out = Path(str(path) + ".dsse")
+    intoto = bool(getattr(args, "intoto", False))
+    if intoto:
+        from cryptography.hazmat.primitives import serialization
+
+        from vtknet.core.intoto import INTOTO_PAYLOAD_TYPE, build_statement
+
+        statement = build_statement(report)
+        body = signing_mod.canonical_json(statement)
+        sk = signing_mod._load_private(key)
+        keyid = hashlib.sha256(
+            sk.public_key().public_bytes(
+                serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+            )
+        ).hexdigest()[:16]
+        sig = sk.sign(signing_mod.pae(INTOTO_PAYLOAD_TYPE, body))
+        envelope = {
+            "payload": base64.b64encode(body).decode("ascii"),
+            "payloadType": INTOTO_PAYLOAD_TYPE,
+            "vtknetMerkleRoot": signing_mod.merkle_root(signing_mod.evidence_leaves(report)),
+            "signatures": [{"keyid": keyid, "sig": base64.b64encode(sig).decode("ascii")}],
+        }
+        out = Path(str(path) + ".intoto.dsse")
+    else:
+        envelope = signing_mod.sign_report(report, key)
+        out = Path(str(path) + ".dsse")
     out.write_text(json.dumps(envelope, indent=2), encoding="utf-8")
     keyid = envelope["signatures"][0]["keyid"]
     result.findings = [
@@ -691,7 +807,12 @@ def _run_sign(args: argparse.Namespace, result: ScanResult) -> None:
             module="sign",
             kind="report.signed",
             host=str(path),
-            detail={"envelope": str(out), "keyid": keyid, "payload_type": envelope["payloadType"]},
+            detail={
+                "envelope": str(out),
+                "keyid": keyid,
+                "payload_type": envelope["payloadType"],
+                "intoto": intoto,
+            },
         )
     ]
     result.stats = {"signed": 1}
@@ -729,6 +850,63 @@ def _run_assert(args: argparse.Namespace, result: ScanResult) -> None:
             where = d.get("host") or ""
             port = f":{d['port']}" if d.get("port") is not None else ""
             print(f"  [{mark}] {d['expect']:<7} {d['kind']}{f' @{where}{port}' if where else ''}")
+
+
+def _run_ech(args: argparse.Namespace, engine: Engine, result: ScanResult) -> None:
+    if len(args.target.split(",")) > 1:
+        raise ValueError("ech expects a single host")
+    dst = net.resolve_host(args.target)
+    if dst != args.target:
+        log.info("resolved %s -> %s", args.target, dst)
+    result.findings, result.stats = echprobe.ech_probe(
+        engine, dst, port=args.port, sni=args.sni
+    )
+
+
+def _run_eval(args: argparse.Namespace, result: ScanResult) -> None:
+    import tempfile
+
+    workdir = args.workdir or tempfile.mkdtemp(prefix="vtk-eval-")
+    findings, stats = idseval.eval_scenario(
+        args.scenario,
+        workdir,
+        engine=args.engine,
+        seed=args.seed,
+        count=args.count,
+        target=args.target,
+    )
+    result.findings, result.stats = findings, stats
+
+
+def _run_watch(args: argparse.Namespace, result: ScanResult) -> None:
+    if getattr(args, "print_profile", False):
+        print(json.dumps(watch_mod.default_profile(), indent=2))
+        result.stats = {"profile": 1}
+        return
+    profile = watch_mod.load_profile(args.profile)
+    watch_mod.watch_loop(profile, args.db or DEFAULT_DB, once=getattr(args, "once", False))
+    result.stats = {"profile": profile.get("name", "default"), "rounds": len(profile.get("rounds", []))}
+
+
+def _run_notarize(args: argparse.Namespace, result: ScanResult) -> None:
+    import json as _json
+    from pathlib import Path as _Path
+
+    try:
+        parsed = _json.loads(_Path(args.report_file).read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"cannot read report ({args.report_file}): {exc}") from exc
+    except _json.JSONDecodeError as exc:
+        raise ValueError(f"not a valid vtknet JSON report: {exc}") from exc
+    if signing_mod.is_envelope(parsed):
+        key = args.key or _newest_key(signing_mod.DEFAULT_KEYS_DIR, "*.pub")
+        parsed = _json.loads(signing_mod.verify_envelope(parsed, key))  # fail closed
+    root = notarize_mod.notarization_root(parsed)
+    entry = None
+    if getattr(args, "online", False):
+        entry = notarize_mod.rekor_submit(root)  # RuntimeError -> clean CLI error
+    result.findings = notarize_mod.notarize_findings(parsed, root, entry)
+    result.stats = {"online": int(entry is not None)}
 
 
 def _run_ledger(args: argparse.Namespace, result: ScanResult) -> None:
@@ -882,9 +1060,33 @@ def _run_fuzz(args: argparse.Namespace, engine: Engine, result: ScanResult) -> N
     dst = net.resolve_host(args.target)
     if dst != args.target:
         log.info("resolved %s -> %s", args.target, dst)
-    result.findings, result.stats = fuzz.fuzz_target(
+    findings, stats = fuzz.fuzz_target(
         engine, dst, count=args.count, base=args.base, port=args.port, seed=args.seed
     )
+    # --minimize: on a recorded crash, delta-debug the crashing mutant live
+    if getattr(args, "minimize", False) and findings and findings[0].kind == "fuzz.host.unresponsive":
+        from vtknet.core.minimize import minimize_from_seed
+
+        crash_index = int(findings[0].detail.get("index", 0))
+        m = minimize_from_seed(engine, dst, args.base, args.port, args.seed, crash_index)
+        findings.append(
+            Finding(
+                module="fuzz",
+                kind="fuzz.minimized",
+                host=dst,
+                detail={
+                    "seed": args.seed,
+                    "crash_index": crash_index,
+                    "removed_fields": m["removed"],
+                    "steps": m["steps"],
+                    "minimal_packet": m["packet"].summary(),
+                    "minimal_hex": bytes(m["packet"]).hex(),
+                },
+                evidence=[Evidence("packet_hex", bytes(m["packet"]).hex(), "minimal crashing packet")],
+            )
+        )
+        stats["minimized_fields"] = len(m["removed"])
+    result.findings, result.stats = findings, stats
 
 
 def _run_wifi(args: argparse.Namespace, result: ScanResult) -> None:
@@ -1063,6 +1265,14 @@ def _run(args: argparse.Namespace) -> ScanResult:
         _run_assert(args, result)
     elif args.command == "ledger":
         _run_ledger(args, result)
+    elif args.command == "ech":
+        _run_ech(args, engine, result)
+    elif args.command == "eval":
+        _run_eval(args, result)
+    elif args.command == "watch":
+        _run_watch(args, result)
+    elif args.command == "notarize":
+        _run_notarize(args, result)
     elif args.command == "pcap":
         _run_pcap(args, result)
     elif args.command == "report":

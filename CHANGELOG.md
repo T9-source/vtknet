@@ -1,6 +1,40 @@
 # Changelog
 
-## 0.8.0 — unreleased (Sprint 1: chain of custody + registry + DX)
+## 0.9.0 — 2026-11-11 (expansion round: ECH, IDS eval, notarize, watch, deep verify)
+
+- **`vtk ech`** (RFC 9849): first-class Encrypted Client Hello surface —
+  ECHConfigList discovery via HTTPS/SVCB DNS records, GREASE-ECH ClientHello
+  (framing-preserving splice), and `ech_required` (121) detection;
+  kinds `ech.dns.*` / `ech.path.*` / `ech.enforced`.
+- **`vtk eval`** (Sprint 2 MVP): `synth --eval` harness — seeded scenario →
+  IDS engine (suricata offline / null) → keyword+target scoring matrix →
+  `eval.detected`/`eval.missed` (HIGH on gaps). Ground truth from the
+  scenario sidecar; CI-ready.
+- **`vtk notarize`**: record the report's evidence Merkle root in the
+  **Rekor v2 transparency log** (`hashes/entries`, kind=intoto) — hash-only
+  disclosure, public timestamp; offline mode emits the manifest.
+- **`vtk sign --intoto`**: in-toto Statement v1 attestations
+  (`application/vnd.in-toto+json`) with per-host subject digests —
+  cosign-compatible shape, verified by the same DSSE pipeline.
+- **`vtk verify --deep`**: re-derives claims from evidence bytes — SYN+ACK
+  for `port.open`, echo-reply for `host.alive`, certificate expiry re-check;
+  `verify.deep.holds` / `.contradicts` (MEDIUM) / `.skipped` (never false-fails).
+- **`vtk watch`** (Sprint 3 MVP): profile-driven probe rounds through the
+  real CLI, auto-diff against the previous round of the same command+target,
+  severity floor, JSON webhook — the one-shot tool learns to live.
+- **`fuzz --minimize`**: on a recorded crash, delta-debug the crashing mutant
+  field-by-field (live re-fires) → `fuzz.minimized` with the minimal packet
+  as evidence — vendor-ready bug report in one command.
+- **Taxonomy contract**: `SCHEMA_VERSION` (SemVer, OSV-style additive-only
+  evolution) stamped into every ScanResult and the JSON Schema
+  (`schema_version` required property); draft-07 retained deliberately
+  (SARIF/Semgrep compatibility).
+- **`action.yml`**: official GitHub Action — `vtk assert` as a desired-state
+  PR gate (exit 1 on violation).
+- kinds registry: 82 registered kinds (was 65); new: `eval.*`, `watch.*`,
+  `notarize.*`, `fuzz.minimized`, `verify.deep.*`, `ech.*`.
+
+## 0.8.0 — evidence chain, signed reports, desired-state
 
 - **Evidence SHA-256**: every `Evidence` stamps its own SHA-256 at creation
   (`core/models.py`) — the first link of the verify/sign chain; the hash

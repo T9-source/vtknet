@@ -51,7 +51,9 @@ root. `synth`, `sniff --offline`, `wifi --offline`, `inspect` and `pcap` never d
 | `inspect` | decode evidence hex / file / pcap bytes back into layers + the exact rebuild command | no |
 | `pcap` | streaming pcap statistics — protocols, top talkers, conversations — without loading the file | no |
 | `report` | query the run history: `--list`, `--show N`, `--diff A B` (added/removed/changed; `:last` = newest run of the same command+target) | no |
-| `kinds` | the finding-kind registry: meanings + default severities; `--schema` emits the JSON Schema | no |
+| `kinds` | the finding-kind registry: meanings + default severities; `--schema` emits the JSON Schema (with `schema_version`) | no |
+| `ech` | Encrypted Client Hello surface (RFC 9849): ECHConfigList via HTTPS/SVCB DNS + GREASE probe + `ech_required` (121) detection | yes |
+| `eval` | `synth --eval`: generate a seeded attack scenario, run an IDS over it, score detection (`eval.detected` / `eval.missed`) | no |
 | `verify` | re-derive every evidence SHA-256 in a saved report — tamper-evident chain of custody (`verify.tampered` on mismatch) | no |
 | `keygen` | generate an Ed25519 signing keypair (`~/.vtknet/keys/`) | no |
 | `sign` | DSSE-sign a saved report (`report.json.dsse`) — standards-grade tamper evidence | no |
@@ -59,6 +61,10 @@ root. `synth`, `sniff --offline`, `wifi --offline`, `inspect` and `pcap` never d
 | `assert` | desired-state assertions over a report — exit 1 on any broken promise | no |
 | `ledger` | double-entry wire audit: unaccounted inbound talkers become findings | live only / `--offline` |
 | `verify --prove ID` | Merkle inclusion proof — share one finding without the rest of the report | no |
+| `verify --deep` | re-derive claims from evidence bytes (SYN+ACK / ICMP type / cert expiry) — the report proves its own words | no |
+| `sign --intoto` | sign as an in-toto Statement v1 (cosign-compatible attestation, per-host subject digests) | no |
+| `notarize` | record the report's evidence Merkle root in the Rekor transparency log (hash-only; `--online` submits) | no |
+| `watch` | scheduled probe rounds + auto-diff alerts (profile JSON, severity floor, webhook) — MVP daemon | yes |
 | `dns` | same query to N resolvers — divergent answers = suspected spoofing (HIGH) | yes |
 | `dhcp` | broadcast discover, classify every offer — rogue-server detection (`--known-server`) | yes |
 | `plugins` | list discovered plugins (see below) | no |

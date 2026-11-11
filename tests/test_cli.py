@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 from vtknet.cli import EXIT_OK, EXIT_USAGE, build_parser, main
 
@@ -124,8 +125,7 @@ class Phase4Test(unittest.TestCase):
             "        return [], {'sent': 1}\n"
         )
         with tempfile.TemporaryDirectory() as d:
-            with open(os.path.join(d, "greet.py"), "w") as fh:
-                fh.write(plugin_src)
+            Path(d, "greet.py").write_text(plugin_src)
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 code = main(["--plugin-dir", d, "greet", "127.0.0.1", "--dry-run"])
@@ -142,8 +142,7 @@ class Phase4Test(unittest.TestCase):
             "        return [], {}\n"
         )
         with tempfile.TemporaryDirectory() as d:
-            with open(os.path.join(d, "evil.py"), "w") as fh:
-                fh.write(plugin_src)
+            Path(d, "evil.py").write_text(plugin_src)
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 code = main(["--plugin-dir", d, "plugins", "--json"])
