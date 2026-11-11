@@ -7,3 +7,9 @@ dist/
 reports/
 .pytest_cache/
 .ruff_cache/
+
+# internal working documents & local artifacts (kept local, never published)
+IDEAS.md
+OBSERVER_LOG.md
+demo-report.json
+.zwork/
